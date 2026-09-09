@@ -19,6 +19,10 @@ JOB_DEFAULT = 'System Architecture / Software Solution'
 INTERVIEW_TYPES = ('AISK', 'DEEP_INTERVIEW')
 QUESTION_TYPES = ('직무이해', '문제해결', '협업')
 
+# 답변 평가 점수체계 v2: 0~4의 5단계 평가 후 Python에서 100점 환산
+SCORING_VERSION = 'v2_0_to_4'
+MAX_LEVEL = 4
+
 SOURCE_RULES = {
     '02_': {'category': 'job', 'source_type': 'official_job_report', 'scope': 'job', 'interview_type': 'ALL'},
     '03_': {'category': 'interview', 'source_type': 'interview_summary', 'scope': 'company', 'interview_type': 'ALL'},
@@ -55,9 +59,9 @@ class DeepFollowUpDraft(BaseModel):
 
 
 class AnswerAnalysisDraft(BaseModel):
-    job_levels: List[Literal[0, 1, 2]] = Field(min_length=3, max_length=3)
+    job_levels: List[Literal[0, 1, 2, 3, 4]] = Field(min_length=3, max_length=3)
     job_reasons: List[str] = Field(min_length=3, max_length=3)
-    answer_levels: List[Literal[0, 1, 2]] = Field(min_length=4, max_length=4)
+    answer_levels: List[Literal[0, 1, 2, 3, 4]] = Field(min_length=4, max_length=4)
     answer_reasons: List[str] = Field(min_length=4, max_length=4)
     strengths: str
     improvements: str
@@ -82,16 +86,16 @@ def _read_text_file(path: str) -> str:
 def _score_from_levels(levels: List[int]) -> int:
     if not levels:
         return 0
-    return round(sum(levels) / (len(levels) * 2) * 100)
+    return round(sum(levels) / (len(levels) * MAX_LEVEL) * 100)
 
 
 def _qualitative_label(levels: List[int]) -> str:
     if not levels:
         return '보완 필요'
     avg = sum(levels) / len(levels)
-    if avg >= 1.5:
+    if avg >= 3.0:
         return '잘 드러남'
-    if avg >= 0.75:
+    if avg >= 1.5:
         return '일부 드러남'
     return '보완 필요'
 
@@ -352,6 +356,7 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
         stt_text: str,
     ) -> str:
         payload = {
+            'scoring_version': SCORING_VERSION,
             'company': self.company,
             'job': self.job,
             'question_text': question_data.get('question_text', ''),
@@ -389,13 +394,20 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 {stt_text}
 
 반드시 다음 규칙을 지켜라.
-- 직무 평가포인트 3개 각각을 순서대로 0/1/2로 판단한다.
-- 답변 구성 기준 4개 각각을 순서대로 0/1/2로 판단한다.
+- 직무 평가포인트 3개 각각을 순서대로 0/1/2/3/4로 판단한다.
+- 답변 구성 기준 4개 각각을 순서대로 0/1/2/3/4로 판단한다.
 - 각 항목마다 판정 이유를 정확히 1개씩 반환한다.
-- 0=드러나지 않음 또는 질문과 무관
-- 1=일부 드러남
-- 2=핵심이 직접적이고 명확하게 드러남
-- 점수는 직접 100점으로 만들지 않는다.
+- STT 답변에 실제로 드러난 내용만 근거로 판단하고, 말하지 않은 내용은 추측하지 않는다.
+- 두 단계 사이에서 애매하면 높은 점수의 조건이 명확히 충족된 경우에만 높은 단계를 선택한다.
+
+[5단계 판정 기준]
+0 = 전혀 드러나지 않거나 질문/평가항목과 무관함
+1 = 관련 내용이나 키워드는 언급했지만 설명·근거가 매우 부족함
+2 = 핵심의 일부를 설명했지만 구체성·근거·연결이 부족함
+3 = 핵심을 비교적 명확히 설명하고 이유·방법·경험 중 필요한 근거가 상당 부분 드러남
+4 = 핵심을 직접적이고 구체적으로 설명하며 이유·방법·근거가 충분하고 논리적으로 연결됨
+
+- 점수는 직접 100점으로 만들지 않는다. 0~4 단계만 반환한다.
 - 합격/불합격, 기업 내부 채점기준, 성격·감정·자신감은 추측하지 않는다.
 '''
         result = self.answer_analysis_llm.invoke(prompt)
@@ -403,6 +415,7 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
         answer_levels = list(result.answer_levels)
 
         return {
+            'scoring_version': SCORING_VERSION,
             'job_evaluation': _qualitative_label(job_levels),
             'answer_evaluation': _qualitative_label(answer_levels),
             'job_score': _score_from_levels(job_levels),
@@ -474,6 +487,7 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 
         return {
             'mode': 'service_cached_repeatability',
+            'scoring_version': SCORING_VERSION,
             'repeats': repeats,
             'job_scores': job_scores,
             'job_range': max(job_scores) - min(job_scores),
@@ -504,6 +518,7 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 
         return {
             'mode': 'raw_llm_variability',
+            'scoring_version': SCORING_VERSION,
             'repeats': repeats,
             'job_scores': job_scores,
             'job_range': max(job_scores) - min(job_scores),
