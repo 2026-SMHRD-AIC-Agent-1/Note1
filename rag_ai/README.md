@@ -34,12 +34,16 @@
 - 재명 파트는 내부 구현보다 입출력 JSON 규격을 먼저 고정한다.
 - API 공통키: company, job, interview_type, question_type, evaluation_points, stt_text
 - OpenAI API Key 등 비밀값은 코드에 저장하지 않고 환경변수로 관리한다.
+- RAG 원문자료는 GitHub에 중복 저장하지 않고 별도 자료 폴더를 `RAG_BASE_PATH` 또는 `base_path`로 연결한다.
 - main/develop 병합 전 샘플 Payload로 연동 테스트한다.
 
 ## 6. 점수 해석 주의
 - 기업 내부 평가표나 합격 가능성을 추정하지 않는다.
 - 점수는 연습용 지표다.
-- LLM은 세부 기준을 0/1/2로 판정하고 100점 환산은 Python이 수행한다.
+- 현재 점수체계는 `v7_five_job_subchecks_strict_answer_100`이다.
+- 직무평가는 평가포인트 3개마다 공통 세부조건 5개를 True/False로 판단하고 Python이 100점으로 환산한다.
+- 답변 구성은 4개 기준 × 4개 세부조건을 True/False로 판단한다.
+- 답변 구성 기본점수가 100점이어도 별도 우수답변 조건 4개를 모두 충족해야 최종 100점이며, 하나라도 충족하지 못하면 95점으로 제한한다.
 - 상대지표는 초기에는 타인 백분위보다 본인 이전 회차 대비 변화를 우선한다.
 
 ## 7. MCP 적용 방향
