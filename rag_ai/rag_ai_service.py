@@ -53,10 +53,10 @@ class DeepFollowUpDraft(BaseModel):
 
 
 class AnswerAnalysisDraft(BaseModel):
-    job_levels: List[Literal[0, 1, 2]]
-    job_reasons: List[str]
-    answer_levels: List[Literal[0, 1, 2]]
-    answer_reasons: List[str]
+    job_levels: List[Literal[0, 1, 2]] = Field(min_length=3, max_length=3)
+    job_reasons: List[str] = Field(min_length=3, max_length=3)
+    answer_levels: List[Literal[0, 1, 2]] = Field(min_length=4, max_length=4)
+    answer_reasons: List[str] = Field(min_length=4, max_length=4)
     strengths: str
     improvements: str
 
