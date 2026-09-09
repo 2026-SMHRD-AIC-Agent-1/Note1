@@ -21,22 +21,66 @@ QUESTION_TYPES = ('직무이해', '문제해결', '협업')
 
 # 답변 평가 점수체계 v7:
 # 1) 직무평가 공통 세부조건을 6개 -> 5개로 정리한다.
-#    v6의 '의미·이유'와 '원인·영향·관계'를 하나의 논리 설명 항목으로 통합한다.
-# 2) 답변 구성 100점은 기존 16개 기본 체크만으로 주지 않는다.
-#    기본 체크가 모두 True여도 별도의 우수답변 조건 4개를 모두 충족해야 100점이다.
+# 2) 답변 구성 100점은 기본 체크가 모두 True여도 별도의 우수답변 조건 4개를 모두 충족해야 한다.
 # 3) LLM은 충족 여부만 판단하고 Python이 실제 점수를 계산한다.
 SCORING_VERSION = 'v7_five_job_subchecks_strict_answer_100'
 JOB_MAX_LEVEL = 5
 ANSWER_MAX_LEVEL = 4
 
+# job_scope:
+# - ALL: 모든 직무에서 사용할 회사/면접 공통자료
+# - 특정 직무명: 해당 직무에서만 사용하는 자료
+# - MULTI: 한 파일에 여러 직무가 있어 현재 선택 직무 부분만 추출해서 사용
 SOURCE_RULES = {
-    '02_': {'category': 'job', 'source_type': 'official_job_report', 'scope': 'job', 'interview_type': 'ALL'},
-    '03_': {'category': 'interview', 'source_type': 'interview_summary', 'scope': 'company', 'interview_type': 'ALL'},
-    '04_': {'category': 'interview_process', 'source_type': 'official_process', 'scope': 'company', 'interview_type': 'AISK'},
-    '05_': {'category': 'recruiting_direction', 'source_type': 'official_story', 'scope': 'company', 'interview_type': 'ALL'},
-    '06_': {'category': 'job', 'source_type': 'official_job_posting', 'scope': 'job', 'interview_type': 'ALL'},
-    '07_': {'category': 'company_values', 'source_type': 'official_home', 'scope': 'company', 'interview_type': 'ALL'},
-    '08_': {'category': 'job_description', 'source_type': 'official_jd_extract', 'scope': 'job', 'interview_type': 'ALL'},
+    '02_': {
+        'category': 'job',
+        'source_type': 'official_job_report',
+        'scope': 'job',
+        'interview_type': 'ALL',
+        'job_scope': JOB_DEFAULT,
+    },
+    '03_': {
+        'category': 'interview',
+        'source_type': 'interview_summary',
+        'scope': 'company',
+        'interview_type': 'ALL',
+        'job_scope': 'ALL',
+    },
+    '04_': {
+        'category': 'interview_process',
+        'source_type': 'official_process',
+        'scope': 'company',
+        'interview_type': 'AISK',
+        'job_scope': 'ALL',
+    },
+    '05_': {
+        'category': 'recruiting_direction',
+        'source_type': 'official_story',
+        'scope': 'company',
+        'interview_type': 'ALL',
+        'job_scope': 'ALL',
+    },
+    '06_': {
+        'category': 'job',
+        'source_type': 'official_job_posting',
+        'scope': 'job',
+        'interview_type': 'ALL',
+        'job_scope': 'Solution SW',
+    },
+    '07_': {
+        'category': 'company_values',
+        'source_type': 'official_home',
+        'scope': 'company',
+        'interview_type': 'ALL',
+        'job_scope': 'ALL',
+    },
+    '08_': {
+        'category': 'job_description',
+        'source_type': 'official_jd_extract',
+        'scope': 'job',
+        'interview_type': 'ALL',
+        'job_scope': 'MULTI',
+    },
 }
 
 ANSWER_STRUCTURE_CRITERIA = [
@@ -46,7 +90,6 @@ ANSWER_STRUCTURE_CRITERIA = [
     '명료하고 일관되게 전달하는가',
 ]
 
-# 특정 기술문제뿐 아니라 직무이해·문제해결·협업 질문에도 공통 적용 가능한 5개 세부조건
 JOB_SUBCHECK_LABELS = [
     '평가항목의 핵심 개념 또는 요구요소를 직접 다뤘는가',
     '그 개념·행동의 의미·이유와 필요한 원인·영향·관계를 논리적으로 설명했는가',
@@ -55,8 +98,6 @@ JOB_SUBCHECK_LABELS = [
     '결과 확인·재측정·검증·성과·학습·후속 적용 중 하나 이상으로 마무리했는가',
 ]
 
-# 답변 구성 100점 전용 우수답변 조건.
-# 기본 구성점수와 별도로 판단하며, 모두 True일 때만 100점을 허용한다.
 ANSWER_EXCELLENCE_LABELS = [
     '답변 초반에 핵심 결론·입장·접근 방향이 분명하게 제시되고 끝까지 유지되는가',
     '결론·이유·근거/예시·방법/행동 중 질문에 필요한 요소들이 단계적으로 자연스럽게 연결되는가',
@@ -64,7 +105,6 @@ ANSWER_EXCELLENCE_LABELS = [
     '반복·모순·불필요한 우회가 거의 없고 핵심을 한 번에 파악할 수 있을 만큼 완성도가 높은가',
 ]
 
-# 답변 구성은 직무내용의 정확성·충분성과 분리하여 표현 구조만 평가한다.
 ANSWER_STRUCTURE_SUBCHECKS = {
     '질문에 직접 대응하는가': [
         '질문과 같은 주제나 문제에 직접 답하고 있는가',
@@ -145,6 +185,45 @@ def _read_text_file(path: str) -> str:
             return f.read()
 
 
+def _find_first_marker(text: str, markers: List[str], start: int = 0) -> int:
+    positions = [text.find(marker, start) for marker in markers]
+    positions = [pos for pos in positions if pos >= 0]
+    return min(positions) if positions else -1
+
+
+def _extract_multi_job_text(text: str, job: str) -> str:
+    """08_ 통합 JD에서 현재 선택한 직무 부분만 안전하게 추출한다."""
+    solution_start = _find_first_marker(text, ['A. Solution SW'])
+    system_start = _find_first_marker(
+        text,
+        [
+            'B. System Architecture / Software Solution',
+            'B. System Architecture · Software Solution',
+        ],
+    )
+    section_end = _find_first_marker(
+        text,
+        [
+            '==================================================\n2. 기존 자료에서 수정이 필요한 부분',
+            '==================================================\r\n2. 기존 자료에서 수정이 필요한 부분',
+        ],
+        start=max(system_start, 0),
+    )
+
+    if job == 'Solution SW':
+        if solution_start < 0 or system_start < 0:
+            return ''
+        return text[solution_start:system_start].strip()
+
+    if job == JOB_DEFAULT:
+        if system_start < 0:
+            return ''
+        end = section_end if section_end >= 0 else len(text)
+        return text[system_start:end].strip()
+
+    return ''
+
+
 def _level_from_checks(checks: List[bool], max_level: int) -> int:
     return sum(1 for value in checks[:max_level] if value)
 
@@ -167,7 +246,6 @@ def _qualitative_label(levels: List[int], max_level: int) -> str:
 
 
 def _answer_score_v7(answer_levels: List[int], excellence_checks: List[bool]) -> int:
-    """기본 구성점수는 유지하되 100점에만 별도 만점 자격을 적용한다."""
     raw_score = _score_from_levels(answer_levels, ANSWER_MAX_LEVEL)
     if raw_score < 100:
         return raw_score
@@ -205,9 +283,6 @@ class RagInterviewAI:
         self.documents: List[Document] = []
         self.chunks: List[Document] = []
         self.faiss_index = None
-
-        # 동일한 질문 + 평가포인트 + STT 답변은 같은 분석결과를 재사용한다.
-        # PoC에서는 프로세스 메모리 캐시를 사용하며, 실제 서비스에서는 DB/Redis로 확장할 수 있다.
         self._analysis_cache: Dict[str, Dict[str, Any]] = {}
 
         self.question_set_llm = self.llm.with_structured_output(QuestionSet)
@@ -236,6 +311,18 @@ class RagInterviewAI:
             text = _read_text_file(full_path).strip()
             if not text:
                 continue
+
+            job_scope = matched_rule.get('job_scope', 'ALL')
+
+            # 현재 선택 직무와 다른 직무의 전용자료는 인덱싱 단계에서 제외한다.
+            if job_scope not in ('ALL', 'MULTI', self.job):
+                continue
+
+            # 08_처럼 한 파일에 여러 직무가 함께 있으면 현재 직무 부분만 남긴다.
+            if job_scope == 'MULTI':
+                text = _extract_multi_job_text(text, self.job)
+                if not text:
+                    continue
 
             metadata = {
                 'company': self.company,
@@ -311,6 +398,11 @@ class RagInterviewAI:
             src_type = meta.get('interview_type', 'ALL')
             if src_type not in ('ALL', interview_type):
                 continue
+
+            source_job = meta.get('job', 'ALL')
+            if source_job not in ('ALL', self.job):
+                continue
+
             title = meta['source_title']
             if title in seen_titles:
                 continue
@@ -374,6 +466,7 @@ class RagInterviewAI:
 - 문제해결 1개
 - 협업 1개
 각 질문의 evaluation_points는 정확히 3개다.
+현재 선택 직무인 '{self.job}'의 업무와 역량만 사용하고 다른 직무의 업무를 섞지 않는다.
 기업 내부 평가기준과 합격 가능성은 추측하지 않는다.
 사용한 근거는 SOURCE 번호만 선택한다.
 
@@ -390,7 +483,9 @@ class RagInterviewAI:
         prompt = f'''
 너는 {self.company} {self.job} 심층 모의면접 질문 생성 AI다.
 아래 RAG 자료만 근거로 지원자의 직무 이해와 문제해결 사고를 깊게 확인할 첫 질문을 정확히 1개 생성하라.
-evaluation_points는 정확히 3개다. 기업 내부 평가기준은 추측하지 않는다.
+evaluation_points는 정확히 3개다.
+현재 선택 직무인 '{self.job}'의 업무와 역량만 사용하고 다른 직무의 업무를 섞지 않는다.
+기업 내부 평가기준은 추측하지 않는다.
 
 [RAG 자료]
 {self._context(sources)}
@@ -418,7 +513,7 @@ evaluation_points는 정확히 3개다. 기업 내부 평가기준은 추측하�
 {stt_text}
 
 답변에서 더 구체적으로 확인할 한 가지를 골라 꼬리질문을 정확히 1개 생성하라.
-이미 충분히 설명된 내용을 반복하지 말고 현재 질문과 평가포인트 범위를 벗어나지 않안는다.
+이미 충분히 설명된 내용을 반복하지 말고 현재 질문과 평가포인트 범위를 벗어나지 않는다.
 기업 내부 평가기준과 합격 가능성은 추측하지 않는다.
 PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 '''
@@ -448,7 +543,6 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
         question_data: Dict[str, Any],
         stt_text: str,
     ) -> Dict[str, Any]:
-        """LLM은 체크만 판단하고 실제 점수 계산과 100점 제한은 Python이 수행한다."""
         job_criteria = question_data.get('evaluation_points', [])[:3]
         if len(job_criteria) != 3:
             raise ValueError('evaluation_points는 정확히 3개가 필요합니다.')
@@ -498,7 +592,7 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 - 짧다는 이유만으로 기본 구성평가를 낮추지 않는다. 짧아도 직접적이고 논리적이며 이해 가능하면 기본 구성점수는 높을 수 있다.
 
 [100점 전용 우수답변 조건은 엄격하게 판단한다]
-- 이 4개 조건은 '평범하게 괜찮은 답변'을 가려내기 위한 것이 아니라 정말 완성도 높은 답변에만 100점을 허용하기 위한 조건이다.
+- 이 4개 조건은 정말 완성도 높은 답변에만 100점을 허용하기 위한 조건이다.
 - 기본 구성 체크가 모두 True라는 이유만으로 우수답변 조건도 자동으로 True로 만들지 않는다.
 - 단순히 짧고 오류가 없거나, 반복·모순이 없다는 이유만으로 우수답변 조건을 True로 만들지 않는다.
 - 1번째 조건은 핵심 결론·입장·접근 방향이 답변 초반부터 명확하고 답변 전체가 그 중심을 유지할 때만 True다.
@@ -570,10 +664,6 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
         stt_text: str,
         use_cache: bool = True,
     ) -> Dict[str, Any]:
-        """
-        기본 동작은 동일 입력에 대해 최초 분석결과를 재사용한다.
-        따라서 같은 질문/평가포인트/STT에는 사용자에게 동일한 점수와 피드백을 반환한다.
-        """
         cache_key = self._analysis_cache_key(question_data, stt_text)
 
         if use_cache and cache_key in self._analysis_cache:
@@ -595,10 +685,6 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
         stt_text: str,
         repeats: int = 3,
     ) -> Dict[str, Any]:
-        """
-        서비스 관점의 동일 입력 재현성을 확인한다.
-        최초 분석 후 같은 입력은 캐시를 사용하므로 동일한 결과가 반환되어야 한다.
-        """
         if repeats < 2:
             raise ValueError('repeats는 2 이상이어야 합니다.')
 
@@ -629,10 +715,6 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
         stt_text: str,
         repeats: int = 3,
     ) -> Dict[str, Any]:
-        """
-        캐시를 끄고 LLM 자체의 세부조건 판정 변동을 점검한다.
-        운영 점수로 사용하지 않고 개발/검증용으로만 사용한다.
-        """
         if repeats < 2:
             raise ValueError('repeats는 2 이상이어야 합니다.')
 
