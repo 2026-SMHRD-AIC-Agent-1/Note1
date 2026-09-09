@@ -19,11 +19,12 @@ JOB_DEFAULT = 'System Architecture / Software Solution'
 INTERVIEW_TYPES = ('AISK', 'DEEP_INTERVIEW')
 QUESTION_TYPES = ('직무이해', '문제해결', '협업')
 
-# 답변 평가 점수체계 v4:
-# LLM은 각 평가항목의 세부조건을 True/False로 체크하고,
-# Python이 충족 개수(0~4)를 레벨로 변환한 뒤 100점으로 환산한다.
-SCORING_VERSION = 'v4_binary_subchecks'
-MAX_LEVEL = 4
+# 답변 평가 점수체계 v5:
+# 직무 평가는 세부조건 6개, 답변 구성은 세부조건 4개를 True/False로 체크한다.
+# LLM은 충족 여부만 판단하고 Python이 점수를 계산한다.
+SCORING_VERSION = 'v5_six_job_subchecks'
+JOB_MAX_LEVEL = 6
+ANSWER_MAX_LEVEL = 4
 
 SOURCE_RULES = {
     '02_': {'category': 'job', 'source_type': 'official_job_report', 'scope': 'job', 'interview_type': 'ALL'},
@@ -42,11 +43,14 @@ ANSWER_STRUCTURE_CRITERIA = [
     '불필요한 반복이나 모순이 적은가',
 ]
 
+# 특정 기술문제뿐 아니라 직무이해·문제해결·협업 질문에도 공통 적용 가능한 6개 세부조건
 JOB_SUBCHECK_LABELS = [
-    '평가항목의 핵심 개념 또는 요구요소를 직접 언급했는가',
-    '그 의미·이유·영향을 설명했는가',
-    '판단 기준·근거·구체적 방법 중 필요한 요소를 제시했는가',
-    '구체적 적용·실행 또는 결과 확인까지 연결해 평가항목을 충분히 완결했는가',
+    '평가항목의 핵심 개념 또는 요구요소를 직접 다뤘는가',
+    '그 개념·행동의 의미나 이유를 설명했는가',
+    '원인·영향·관계 또는 논리적 연결을 설명했는가',
+    '판단 기준·근거·지표·사례 중 하나 이상을 구체적으로 제시했는가',
+    '실제로 어떻게 접근·행동·적용할지 구체적인 방법이나 순서를 제시했는가',
+    '결과 확인·재측정·검증·성과·학습·후속 적용 중 하나 이상으로 마무리했는가',
 ]
 
 ANSWER_STRUCTURE_SUBCHECKS = {
@@ -69,8 +73,8 @@ ANSWER_STRUCTURE_SUBCHECKS = {
         '결과 확인·검증·적용 예시 중 하나 이상이 있는가',
     ],
     '불필요한 반복이나 모순이 적은가': [
-        '같은 내용을 불필요하게 반복하지 않는가',
-        '답변 내부에 서로 충돌하는 내용이 없는가',
+        '불필요한 반복이 발견되지 않는가',
+        '서로 충돌하거나 모순되는 내용이 발견되지 않는가',
         '문장과 문장 사이의 흐름이 자연스러운가',
         '핵심에서 크게 이탈하는 내용이 없는가',
     ],
@@ -94,14 +98,19 @@ class DeepFollowUpDraft(BaseModel):
     follow_up_reason: str
 
 
-class CriterionChecklist(BaseModel):
+class JobCriterionChecklist(BaseModel):
+    checks: List[bool] = Field(min_length=6, max_length=6)
+    reason: str
+
+
+class AnswerCriterionChecklist(BaseModel):
     checks: List[bool] = Field(min_length=4, max_length=4)
     reason: str
 
 
 class AnswerAnalysisDraft(BaseModel):
-    job_checks: List[CriterionChecklist] = Field(min_length=3, max_length=3)
-    answer_checks: List[CriterionChecklist] = Field(min_length=4, max_length=4)
+    job_checks: List[JobCriterionChecklist] = Field(min_length=3, max_length=3)
+    answer_checks: List[AnswerCriterionChecklist] = Field(min_length=4, max_length=4)
     strengths: str
     improvements: str
 
@@ -122,23 +131,23 @@ def _read_text_file(path: str) -> str:
             return f.read()
 
 
-def _level_from_checks(checks: List[bool]) -> int:
-    return sum(1 for value in checks[:MAX_LEVEL] if value)
+def _level_from_checks(checks: List[bool], max_level: int) -> int:
+    return sum(1 for value in checks[:max_level] if value)
 
 
-def _score_from_levels(levels: List[int]) -> int:
+def _score_from_levels(levels: List[int], max_level: int) -> int:
     if not levels:
         return 0
-    return round(sum(levels) / (len(levels) * MAX_LEVEL) * 100)
+    return round(sum(levels) / (len(levels) * max_level) * 100)
 
 
-def _qualitative_label(levels: List[int]) -> str:
+def _qualitative_label(levels: List[int], max_level: int) -> str:
     if not levels:
         return '보완 필요'
-    avg = sum(levels) / len(levels)
-    if avg >= 3.0:
+    ratio = sum(levels) / (len(levels) * max_level)
+    if ratio >= 0.75:
         return '잘 드러남'
-    if avg >= 1.5:
+    if ratio >= 0.375:
         return '일부 드러남'
     return '보완 필요'
 
@@ -430,7 +439,7 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 [공개자료 기반 직무 평가포인트]
 {json.dumps(job_criteria, ensure_ascii=False)}
 
-[직무 평가포인트별 공통 세부조건 - 반드시 이 순서로 4개]
+[직무 평가포인트별 공통 세부조건 - 반드시 이 순서로 6개]
 {json.dumps(JOB_SUBCHECK_LABELS, ensure_ascii=False)}
 
 [답변 구성 기준과 각 세부조건]
@@ -440,13 +449,16 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 {stt_text}
 
 반드시 다음 규칙을 지켜라.
-- 0~4 점수나 레벨을 직접 선택하지 않는다.
-- 직무 평가포인트 3개 각각에 대해 세부조건 4개를 순서대로 True/False로만 판단한다.
+- 점수나 레벨을 직접 선택하지 않는다.
+- 직무 평가포인트 3개 각각에 대해 세부조건 6개를 순서대로 True/False로만 판단한다.
 - 답변 구성 기준 4개 각각에 대해 해당 기준의 세부조건 4개를 순서대로 True/False로만 판단한다.
-- STT 답변에 실제로 드러난 내용만 근거로 판단한다. 말하지 않은 내용은 추측하지 않는다.
-- 단순히 관련 용어가 있다는 이유만으로 여러 조건을 동시에 True로 만들지 않는다.
-- 각 True는 해당 세부조건을 뒷받침하는 명시적인 내용이 답변에 있을 때만 선택한다.
-- 직무 평가의 네 번째 조건은 모든 평가항목에 무조건 검증을 요구하는 뜻이 아니다. 해당 평가항목을 실제 적용·실행·결과 확인까지 충분히 완결했을 때 True로 판단한다.
+- STT 답변에 실제로 드러난 내용만 근거로 판단하고, 말하지 않은 직무지식·경험은 추측하지 않는다.
+- 단순히 관련 전문용어가 있다는 이유만으로 여러 직무 세부조건을 동시에 True로 만들지 않는다.
+- 직무 세부조건의 True는 답변 안에 그 조건을 뒷받침하는 내용이 실제로 있을 때만 선택한다.
+- 4번째 직무 세부조건은 판단 기준·근거·지표·사례 중 해당 평가항목에 자연스럽게 맞는 것이 하나 이상 구체적으로 드러나면 True다.
+- 6번째 직무 세부조건은 기술 질문에서는 재측정·검증, 경험 질문에서는 결과·성과·학습·후속 적용처럼 질문 성격에 맞게 판단한다.
+- 답변 구성 평가는 내용의 존재 여부뿐 아니라 답변 전체의 구조와 표현을 보고 판단한다.
+- 특히 '불필요한 반복이나 모순이 적은가'의 앞 두 조건은 답변자가 직접 '반복하지 않았다/모순이 없다'고 말해야 하는 것이 아니다. 답변 전체를 검토했을 때 실제 반복이나 모순이 발견되지 않으면 True다.
 - 신입 지원자에게 실제 현업 경험이나 회사 내부 수치를 요구하지 않는다.
 - 각 평가항목마다 전체 판단 이유를 한 문장으로 반환한다.
 - strengths와 improvements는 체크 결과에 근거해 작성한다.
@@ -454,21 +466,28 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 '''
         result = self.answer_analysis_llm.invoke(prompt)
 
-        job_levels = [_level_from_checks(item.checks) for item in result.job_checks]
-        answer_levels = [_level_from_checks(item.checks) for item in result.answer_checks]
+        job_levels = [
+            _level_from_checks(item.checks, JOB_MAX_LEVEL)
+            for item in result.job_checks
+        ]
+        answer_levels = [
+            _level_from_checks(item.checks, ANSWER_MAX_LEVEL)
+            for item in result.answer_checks
+        ]
 
         return {
             'scoring_version': SCORING_VERSION,
-            'job_evaluation': _qualitative_label(job_levels),
-            'answer_evaluation': _qualitative_label(answer_levels),
-            'job_score': _score_from_levels(job_levels),
-            'answer_score': _score_from_levels(answer_levels),
+            'job_evaluation': _qualitative_label(job_levels, JOB_MAX_LEVEL),
+            'answer_evaluation': _qualitative_label(answer_levels, ANSWER_MAX_LEVEL),
+            'job_score': _score_from_levels(job_levels, JOB_MAX_LEVEL),
+            'answer_score': _score_from_levels(answer_levels, ANSWER_MAX_LEVEL),
             'strengths': result.strengths,
             'improvements': result.improvements,
             'job_criteria': [
                 {
                     'criterion': criterion,
                     'level': job_levels[i],
+                    'max_level': JOB_MAX_LEVEL,
                     'checks': list(result.job_checks[i].checks),
                     'check_labels': JOB_SUBCHECK_LABELS,
                     'reason': result.job_checks[i].reason,
@@ -479,6 +498,7 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
                 {
                     'criterion': criterion,
                     'level': answer_levels[i],
+                    'max_level': ANSWER_MAX_LEVEL,
                     'checks': list(result.answer_checks[i].checks),
                     'check_labels': ANSWER_STRUCTURE_SUBCHECKS[criterion],
                     'reason': result.answer_checks[i].reason,
