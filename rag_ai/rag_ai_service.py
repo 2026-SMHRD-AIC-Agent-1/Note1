@@ -1,5 +1,7 @@
 import os
 import json
+import copy
+import hashlib
 import statistics
 from typing import Any, Dict, List, Literal, Optional
 
@@ -125,6 +127,10 @@ class RagInterviewAI:
         self.documents: List[Document] = []
         self.chunks: List[Document] = []
         self.faiss_index = None
+
+        # 동일한 질문 + 평가포인트 + STT 답변은 같은 분석결과를 재사용한다.
+        # PoC에서는 프로세스 메모리 캐시를 사용하며, 실제 서비스에서는 DB/Redis로 확장할 수 있다.
+        self._analysis_cache: Dict[str, Dict[str, Any]] = {}
 
         self.question_set_llm = self.llm.with_structured_output(QuestionSet)
         self.deep_followup_llm = self.llm.with_structured_output(DeepFollowUpDraft)
@@ -340,8 +346,32 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 '''
         return self.deep_followup_llm.invoke(prompt).model_dump()
 
-    def analyze_answer(self, question_data: Dict[str, Any], stt_text: str) -> Dict[str, Any]:
+    def _analysis_cache_key(
+        self,
+        question_data: Dict[str, Any],
+        stt_text: str,
+    ) -> str:
+        payload = {
+            'company': self.company,
+            'job': self.job,
+            'question_text': question_data.get('question_text', ''),
+            'evaluation_points': question_data.get('evaluation_points', [])[:3],
+            'answer_structure_criteria': ANSWER_STRUCTURE_CRITERIA,
+            'stt_text': ' '.join(stt_text.split()),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+    def _analyze_answer_once(
+        self,
+        question_data: Dict[str, Any],
+        stt_text: str,
+    ) -> Dict[str, Any]:
+        """LLM을 실제로 한 번 호출해 답변을 분석한다. 캐시는 사용하지 않는다."""
         job_criteria = question_data.get('evaluation_points', [])[:3]
+        if len(job_criteria) != 3:
+            raise ValueError('evaluation_points는 정확히 3개가 필요합니다.')
+
         prompt = f'''
 너는 모의면접 답변 분석 AI다.
 기업 내부 평가표가 아니라 아래 공개자료 기반 평가포인트와 답변 구성 기준만 사용한다.
@@ -358,16 +388,19 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 [STT 답변]
 {stt_text}
 
-각 기준을 0/1/2로 판단한다.
-0=드러나지 않음 또는 질문과 무관
-1=일부 드러남
-2=핵심이 직접적이고 명확하게 드러남
-점수는 직접 100점으로 만들지 말고 각 기준의 단계와 이유만 반환한다.
-합격/불합격, 기업 내부 채점기준, 성격·감정·자신감은 추측하지 않는다.
+반드시 다음 규칙을 지켜라.
+- 직무 평가포인트 3개 각각을 순서대로 0/1/2로 판단한다.
+- 답변 구성 기준 4개 각각을 순서대로 0/1/2로 판단한다.
+- 각 항목마다 판정 이유를 정확히 1개씩 반환한다.
+- 0=드러나지 않음 또는 질문과 무관
+- 1=일부 드러남
+- 2=핵심이 직접적이고 명확하게 드러남
+- 점수는 직접 100점으로 만들지 않는다.
+- 합격/불합격, 기업 내부 채점기준, 성격·감정·자신감은 추측하지 않는다.
 '''
         result = self.answer_analysis_llm.invoke(prompt)
-        job_levels = list(result.job_levels)[:len(job_criteria)]
-        answer_levels = list(result.answer_levels)[:len(ANSWER_STRUCTURE_CRITERIA)]
+        job_levels = list(result.job_levels)
+        answer_levels = list(result.answer_levels)
 
         return {
             'job_evaluation': _qualitative_label(job_levels),
@@ -377,14 +410,47 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
             'strengths': result.strengths,
             'improvements': result.improvements,
             'job_criteria': [
-                {'criterion': c, 'level': job_levels[i], 'reason': result.job_reasons[i] if i < len(result.job_reasons) else ''}
+                {
+                    'criterion': c,
+                    'level': job_levels[i],
+                    'reason': result.job_reasons[i],
+                }
                 for i, c in enumerate(job_criteria)
             ],
             'answer_criteria': [
-                {'criterion': c, 'level': answer_levels[i], 'reason': result.answer_reasons[i] if i < len(result.answer_reasons) else ''}
+                {
+                    'criterion': c,
+                    'level': answer_levels[i],
+                    'reason': result.answer_reasons[i],
+                }
                 for i, c in enumerate(ANSWER_STRUCTURE_CRITERIA)
             ],
         }
+
+    def analyze_answer(
+        self,
+        question_data: Dict[str, Any],
+        stt_text: str,
+        use_cache: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        기본 동작은 동일 입력에 대해 최초 분석결과를 재사용한다.
+        따라서 같은 질문/평가포인트/STT에는 사용자에게 동일한 점수와 피드백을 반환한다.
+        """
+        cache_key = self._analysis_cache_key(question_data, stt_text)
+
+        if use_cache and cache_key in self._analysis_cache:
+            cached = copy.deepcopy(self._analysis_cache[cache_key])
+            cached['cache_hit'] = True
+            return cached
+
+        analyzed = self._analyze_answer_once(question_data, stt_text)
+        analyzed['cache_hit'] = False
+
+        if use_cache:
+            self._analysis_cache[cache_key] = copy.deepcopy(analyzed)
+
+        return analyzed
 
     def check_analysis_repeatability(
         self,
@@ -392,10 +458,52 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
         stt_text: str,
         repeats: int = 3,
     ) -> Dict[str, Any]:
-        runs = [self.analyze_answer(question_data, stt_text) for _ in range(repeats)]
+        """
+        서비스 관점의 동일 입력 재현성을 확인한다.
+        최초 분석 후 같은 입력은 캐시를 사용하므로 동일한 결과가 반환되어야 한다.
+        """
+        if repeats < 2:
+            raise ValueError('repeats는 2 이상이어야 합니다.')
+
+        cache_key = self._analysis_cache_key(question_data, stt_text)
+        self._analysis_cache.pop(cache_key, None)
+
+        runs = [self.analyze_answer(question_data, stt_text, use_cache=True) for _ in range(repeats)]
         job_scores = [r['job_score'] for r in runs]
         answer_scores = [r['answer_score'] for r in runs]
+
         return {
+            'mode': 'service_cached_repeatability',
+            'repeats': repeats,
+            'job_scores': job_scores,
+            'job_range': max(job_scores) - min(job_scores),
+            'job_std': round(statistics.pstdev(job_scores), 3),
+            'answer_scores': answer_scores,
+            'answer_range': max(answer_scores) - min(answer_scores),
+            'answer_std': round(statistics.pstdev(answer_scores), 3),
+            'cache_hits': [r.get('cache_hit', False) for r in runs],
+            'raw_runs': runs,
+        }
+
+    def check_raw_llm_variability(
+        self,
+        question_data: Dict[str, Any],
+        stt_text: str,
+        repeats: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        캐시를 끄고 LLM 자체의 판정 변동을 점검한다.
+        운영 점수로 사용하지 않고 개발/검증용으로만 사용한다.
+        """
+        if repeats < 2:
+            raise ValueError('repeats는 2 이상이어야 합니다.')
+
+        runs = [self._analyze_answer_once(question_data, stt_text) for _ in range(repeats)]
+        job_scores = [r['job_score'] for r in runs]
+        answer_scores = [r['answer_score'] for r in runs]
+
+        return {
+            'mode': 'raw_llm_variability',
             'repeats': repeats,
             'job_scores': job_scores,
             'job_range': max(job_scores) - min(job_scores),
