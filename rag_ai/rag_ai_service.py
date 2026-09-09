@@ -19,8 +19,10 @@ JOB_DEFAULT = 'System Architecture / Software Solution'
 INTERVIEW_TYPES = ('AISK', 'DEEP_INTERVIEW')
 QUESTION_TYPES = ('직무이해', '문제해결', '협업')
 
-# 답변 평가 점수체계 v3: 0~4의 5단계 유지 + 3점/4점 판정 경계 구체화
-SCORING_VERSION = 'v3_rubric_0_to_4'
+# 답변 평가 점수체계 v4:
+# LLM은 각 평가항목의 세부조건을 True/False로 체크하고,
+# Python이 충족 개수(0~4)를 레벨로 변환한 뒤 100점으로 환산한다.
+SCORING_VERSION = 'v4_binary_subchecks'
 MAX_LEVEL = 4
 
 SOURCE_RULES = {
@@ -40,6 +42,40 @@ ANSWER_STRUCTURE_CRITERIA = [
     '불필요한 반복이나 모순이 적은가',
 ]
 
+JOB_SUBCHECK_LABELS = [
+    '평가항목의 핵심 개념 또는 요구요소를 직접 언급했는가',
+    '그 의미·이유·영향을 설명했는가',
+    '판단 기준·근거·구체적 방법 중 필요한 요소를 제시했는가',
+    '구체적 적용·실행 또는 결과 확인까지 연결해 평가항목을 충분히 완결했는가',
+]
+
+ANSWER_STRUCTURE_SUBCHECKS = {
+    '질문이 요구한 핵심에 대응하고 있는가': [
+        '질문의 핵심 요구에 직접 답했는가',
+        '질문이 요구한 주요 하위요소를 포함했는가',
+        '질문 범위를 크게 벗어나지 않았는가',
+        '답변의 중심 결론 또는 방향이 명확한가',
+    ],
+    '결론과 이유가 논리적으로 연결되는가': [
+        '결론 또는 핵심 주장이 있는가',
+        '그 결론을 뒷받침하는 이유나 근거가 있는가',
+        '결론과 이유의 연결이 명확한가',
+        '설명의 순서·인과관계가 일관적인가',
+    ],
+    '구체적인 설명이나 경험이 포함되어 있는가': [
+        '구체적인 개념·지표·사례 중 하나 이상이 있는가',
+        '실제로 무엇을 하겠는지 또는 무엇을 했는지 방법·행동이 있는가',
+        '판단 근거·비교 기준·세부 설명 중 하나 이상이 있는가',
+        '결과 확인·검증·적용 예시 중 하나 이상이 있는가',
+    ],
+    '불필요한 반복이나 모순이 적은가': [
+        '같은 내용을 불필요하게 반복하지 않는가',
+        '답변 내부에 서로 충돌하는 내용이 없는가',
+        '문장과 문장 사이의 흐름이 자연스러운가',
+        '핵심에서 크게 이탈하는 내용이 없는가',
+    ],
+}
+
 
 class QuestionDraft(BaseModel):
     question_type: Literal['직무이해', '문제해결', '협업']
@@ -58,11 +94,14 @@ class DeepFollowUpDraft(BaseModel):
     follow_up_reason: str
 
 
+class CriterionChecklist(BaseModel):
+    checks: List[bool] = Field(min_length=4, max_length=4)
+    reason: str
+
+
 class AnswerAnalysisDraft(BaseModel):
-    job_levels: List[Literal[0, 1, 2, 3, 4]] = Field(min_length=3, max_length=3)
-    job_reasons: List[str] = Field(min_length=3, max_length=3)
-    answer_levels: List[Literal[0, 1, 2, 3, 4]] = Field(min_length=4, max_length=4)
-    answer_reasons: List[str] = Field(min_length=4, max_length=4)
+    job_checks: List[CriterionChecklist] = Field(min_length=3, max_length=3)
+    answer_checks: List[CriterionChecklist] = Field(min_length=4, max_length=4)
     strengths: str
     improvements: str
 
@@ -81,6 +120,10 @@ def _read_text_file(path: str) -> str:
     except UnicodeDecodeError:
         with open(path, 'r', encoding='cp949') as f:
             return f.read()
+
+
+def _level_from_checks(checks: List[bool]) -> int:
+    return sum(1 for value in checks[:MAX_LEVEL] if value)
 
 
 def _score_from_levels(levels: List[int]) -> int:
@@ -372,7 +415,7 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
         question_data: Dict[str, Any],
         stt_text: str,
     ) -> Dict[str, Any]:
-        """LLM을 실제로 한 번 호출해 답변을 분석한다. 캐시는 사용하지 않는다."""
+        """LLM은 세부조건의 충족 여부만 판단하고 점수 계산은 Python이 수행한다."""
         job_criteria = question_data.get('evaluation_points', [])[:3]
         if len(job_criteria) != 3:
             raise ValueError('evaluation_points는 정확히 3개가 필요합니다.')
@@ -387,41 +430,32 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 [공개자료 기반 직무 평가포인트]
 {json.dumps(job_criteria, ensure_ascii=False)}
 
-[답변 구성 기준]
-{json.dumps(ANSWER_STRUCTURE_CRITERIA, ensure_ascii=False)}
+[직무 평가포인트별 공통 세부조건 - 반드시 이 순서로 4개]
+{json.dumps(JOB_SUBCHECK_LABELS, ensure_ascii=False)}
+
+[답변 구성 기준과 각 세부조건]
+{json.dumps(ANSWER_STRUCTURE_SUBCHECKS, ensure_ascii=False)}
 
 [STT 답변]
 {stt_text}
 
 반드시 다음 규칙을 지켜라.
-- 직무 평가포인트 3개 각각을 순서대로 0/1/2/3/4로 판단한다.
-- 답변 구성 기준 4개 각각을 순서대로 0/1/2/3/4로 판단한다.
-- 각 항목마다 판정 이유를 정확히 1개씩 반환한다.
-- STT 답변에 실제로 드러난 내용만 근거로 판단하고, 말하지 않은 내용은 추측하지 않는다.
-- 평가항목 문장에서 요구하는 핵심 요소를 먼저 식별한 뒤, 답변이 그 요소를 얼마나 충족하는지 판단한다.
-- 두 단계 사이에서 애매하면 높은 점수의 조건이 명확히 충족된 경우에만 높은 단계를 선택한다.
-
-[5단계 공통 판정 기준]
-0 = 관련 내용이 전혀 없거나 질문/평가항목과 무관함
-1 = 관련 키워드나 방향만 언급했으며 의미·이유·근거가 거의 없음
-2 = 핵심 개념과 기본 이유는 일부 설명했지만 판단 기준, 구체적 방법, 연결 논리가 부족함
-3 = 핵심 개념을 정확히 설명하고 판단 기준 또는 구체적 방법을 제시했으며 논리적 연결이 대부분 드러남. 다만 실행 방법·검증·결과 확인 중 중요한 요소가 하나 이상 부족하거나 구체성이 제한됨
-4 = 평가항목이 요구하는 핵심을 직접적이고 구체적으로 설명하고, 판단 기준 또는 근거를 제시하며, 실제로 어떻게 접근·실행할지와 결과를 어떻게 확인·검증할지까지 일관된 흐름으로 연결함
-
-[3점과 4점 구분 규칙]
-- 3점은 '잘 설명했다' 수준이다. 개념은 정확하고 방법이나 판단 기준도 있으나, 끝까지 검증 가능한 실행 흐름으로 완성되지 않은 경우다.
-- 4점은 '충분히 설명했다' 수준이다. 단순히 전문용어가 많다고 4점을 주지 않는다.
-- 직무 평가포인트에서 4점을 주려면 가능한 범위에서 다음 흐름이 답변에 드러나야 한다: 핵심 개념/의미 → 판단 기준·지표 또는 근거 → 구체적 접근·실행 방법 → 결과 확인·재측정·검증.
-- 평가포인트 특성상 위 네 요소가 모두 필요하지 않은 경우에는, 그 평가포인트가 요구하는 요소가 빠짐없이 구체적으로 충족되면 4점을 줄 수 있다.
-- 신입 지원자에게 실제 현업 경험이나 실제 회사 내부 수치가 있어야만 4점을 주는 것은 아니다. 답변 안에서 판단 기준·실행 방법·검증 흐름이 충분하면 4점이 가능하다.
-- 답변 구성 기준의 4점은 해당 구성 기준이 답변 전체에서 명확하고 일관되게 충족될 때만 부여한다.
-
-- 점수는 직접 100점으로 만들지 않는다. 0~4 단계만 반환한다.
+- 0~4 점수나 레벨을 직접 선택하지 않는다.
+- 직무 평가포인트 3개 각각에 대해 세부조건 4개를 순서대로 True/False로만 판단한다.
+- 답변 구성 기준 4개 각각에 대해 해당 기준의 세부조건 4개를 순서대로 True/False로만 판단한다.
+- STT 답변에 실제로 드러난 내용만 근거로 판단한다. 말하지 않은 내용은 추측하지 않는다.
+- 단순히 관련 용어가 있다는 이유만으로 여러 조건을 동시에 True로 만들지 않는다.
+- 각 True는 해당 세부조건을 뒷받침하는 명시적인 내용이 답변에 있을 때만 선택한다.
+- 직무 평가의 네 번째 조건은 모든 평가항목에 무조건 검증을 요구하는 뜻이 아니다. 해당 평가항목을 실제 적용·실행·결과 확인까지 충분히 완결했을 때 True로 판단한다.
+- 신입 지원자에게 실제 현업 경험이나 회사 내부 수치를 요구하지 않는다.
+- 각 평가항목마다 전체 판단 이유를 한 문장으로 반환한다.
+- strengths와 improvements는 체크 결과에 근거해 작성한다.
 - 합격/불합격, 기업 내부 채점기준, 성격·감정·자신감은 추측하지 않는다.
 '''
         result = self.answer_analysis_llm.invoke(prompt)
-        job_levels = list(result.job_levels)
-        answer_levels = list(result.answer_levels)
+
+        job_levels = [_level_from_checks(item.checks) for item in result.job_checks]
+        answer_levels = [_level_from_checks(item.checks) for item in result.answer_checks]
 
         return {
             'scoring_version': SCORING_VERSION,
@@ -433,19 +467,23 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
             'improvements': result.improvements,
             'job_criteria': [
                 {
-                    'criterion': c,
+                    'criterion': criterion,
                     'level': job_levels[i],
-                    'reason': result.job_reasons[i],
+                    'checks': list(result.job_checks[i].checks),
+                    'check_labels': JOB_SUBCHECK_LABELS,
+                    'reason': result.job_checks[i].reason,
                 }
-                for i, c in enumerate(job_criteria)
+                for i, criterion in enumerate(job_criteria)
             ],
             'answer_criteria': [
                 {
-                    'criterion': c,
+                    'criterion': criterion,
                     'level': answer_levels[i],
-                    'reason': result.answer_reasons[i],
+                    'checks': list(result.answer_checks[i].checks),
+                    'check_labels': ANSWER_STRUCTURE_SUBCHECKS[criterion],
+                    'reason': result.answer_checks[i].reason,
                 }
-                for i, c in enumerate(ANSWER_STRUCTURE_CRITERIA)
+                for i, criterion in enumerate(ANSWER_STRUCTURE_CRITERIA)
             ],
         }
 
@@ -515,7 +553,7 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
         repeats: int = 3,
     ) -> Dict[str, Any]:
         """
-        캐시를 끄고 LLM 자체의 판정 변동을 점검한다.
+        캐시를 끄고 LLM 자체의 세부조건 판정 변동을 점검한다.
         운영 점수로 사용하지 않고 개발/검증용으로만 사용한다.
         """
         if repeats < 2:
