@@ -1,0 +1,7 @@
+faiss-cpu
+sentence-transformers
+langchain-core
+langchain-text-splitters
+langchain-openai
+pydantic
+numpy
