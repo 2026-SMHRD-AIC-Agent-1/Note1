@@ -1,0 +1,19 @@
+# --- Backend / DB ---
+fastapi
+uvicorn[standard]
+sqlmodel
+python-dotenv
+python-multipart
+
+# --- STT (stt_service.py, 답변 녹화 파일 업로드용) ---
+openai
+
+# --- RAG·언어 AI (interview_ai_service_v0_1.py, 재명씨 requirements_ai_interview_v0.1.txt 병합) ---
+langchain-openai
+langchain-core
+langchain-text-splitters
+sentence-transformers
+faiss-cpu
+pypdf
+pydantic>=2
+numpy

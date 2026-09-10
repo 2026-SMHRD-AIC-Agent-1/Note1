@@ -1,0 +1,18 @@
+# 가상환경 (지금 압축 파일에 .venv가 통째로 들어있었는데, Git에는 올리지 않는 게 정석입니다)
+.venv/
+__pycache__/
+*.pyc
+
+# 로컬 DB 파일 (팀원마다 자기 컴퓨터에서 새로 생성됨)
+app.db
+test_app.db
+test_ai_payload.db
+
+# RAG 원문 자료 폴더 (용량이 크고 사람마다 경로가 다름 — .env의 RAG_DATA_DIR로 관리)
+rag_data/
+
+# 업로드된 답변 녹화 파일 (용량 크고 사용자 데이터 - Git에 올리지 않음)
+uploads/
+
+# 비밀값이 든 실제 환경변수 파일 (템플릿인 .env.example만 공유)
+.env
