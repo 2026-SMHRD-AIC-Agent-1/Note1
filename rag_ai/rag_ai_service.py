@@ -220,16 +220,12 @@ def _answer_score_v8(answer_levels: List[int], excellence_checks: List[bool]) ->
     }
 
 
-def _progress_label(change: int) -> str:
-    if change >= 15:
-        return '크게 향상'
-    if change >= 5:
-        return '향상'
-    if change <= -15:
-        return '크게 하락'
-    if change <= -5:
+def _score_flow_direction(change: int) -> str:
+    if change > 0:
+        return '상승'
+    if change < 0:
         return '하락'
-    return '비슷한 수준'
+    return '동일'
 
 
 class RagInterviewAI:
@@ -537,70 +533,161 @@ evaluation_points도 정확히 3개 생성하고 practice_reason에는 왜 더 �
             self._analysis_cache[cache_key] = copy.deepcopy(analyzed)
         return analyzed
 
-    def analyze_deep_session(self, turns: List[Dict[str, Any]], use_cache: bool = True) -> Dict[str, Any]:
+    def analyze_deep_turn(
+        self,
+        question_data: Dict[str, Any],
+        stt_text: str,
+        use_cache: bool = True,
+    ) -> Dict[str, Any]:
+        """심층면접의 한 답변을 한 번 평가하고, 이후 저장·종합에 사용할 turn 객체를 반환한다."""
+        if not str(stt_text).strip():
+            raise ValueError('stt_text가 비어 있습니다.')
+        analysis = self.analyze_answer(question_data, stt_text, use_cache=use_cache)
+        return {
+            'question_data': copy.deepcopy(question_data),
+            'stt_text': stt_text,
+            'analysis': copy.deepcopy(analysis),
+        }
+
+    def analyze_deep_session(self, turns: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """면접 중 이미 저장한 답변별 평가를 재채점하지 않고 종합한다."""
         if not turns:
             raise ValueError('심층면접 turns가 비어 있습니다.')
         max_turns = 1 + DEEP_MAX_FOLLOWUPS
         if len(turns) > max_turns:
-            raise ValueError(f'심층면접 답변은 최대 {max_turns}개까지 분석할 수 있습니다.')
+            raise ValueError(f'심층면접 답변은 최대 {max_turns}개까지 종합할 수 있습니다.')
 
         answer_reviews = []
+        required_analysis_keys = {'job_score', 'answer_score', 'strengths', 'improvements'}
+
         for turn_no, turn in enumerate(turns, 1):
             question_data = turn.get('question_data')
             stt_text = turn.get('stt_text', '')
+            analysis = turn.get('analysis')
+
             if not isinstance(question_data, dict):
                 raise ValueError(f'{turn_no}번째 turn의 question_data가 필요합니다.')
             if not str(stt_text).strip():
                 raise ValueError(f'{turn_no}번째 turn의 stt_text가 비어 있습니다.')
-            analysis = self.analyze_answer(question_data, stt_text, use_cache=use_cache)
+            if not isinstance(analysis, dict):
+                raise ValueError(
+                    f'{turn_no}번째 turn의 저장된 analysis가 필요합니다. '
+                    '면접 진행 중 analyze_deep_turn() 또는 analyze_answer() 결과를 저장한 뒤 전달하세요.'
+                )
+
+            missing = required_analysis_keys - set(analysis.keys())
+            if missing:
+                raise ValueError(
+                    f'{turn_no}번째 turn의 analysis에 필수값이 없습니다: {sorted(missing)}'
+                )
+            if analysis.get('scoring_version') not in (None, SCORING_VERSION):
+                raise ValueError(
+                    f'{turn_no}번째 turn의 scoring_version이 현재 버전과 다릅니다.'
+                )
+
+            saved_analysis = copy.deepcopy(analysis)
             answer_reviews.append({
                 'turn_no': turn_no,
                 'question_type': question_data.get('question_type'),
                 'question_text': question_data.get('question_text', ''),
                 'stt_text': stt_text,
-                'job_score': analysis['job_score'],
-                'answer_score': analysis['answer_score'],
-                'strengths': analysis['strengths'],
-                'improvements': analysis['improvements'],
-                'analysis': analysis,
+                'job_score': saved_analysis['job_score'],
+                'answer_score': saved_analysis['answer_score'],
+                'strengths': saved_analysis['strengths'],
+                'improvements': saved_analysis['improvements'],
+                'analysis': saved_analysis,
             })
 
         job_scores = [item['job_score'] for item in answer_reviews]
         answer_scores = [item['answer_score'] for item in answer_reviews]
         overall_job_score = _round_half_up(sum(job_scores) / len(job_scores))
         overall_answer_score = _round_half_up(sum(answer_scores) / len(answer_scores))
+
         job_change = job_scores[-1] - job_scores[0] if len(job_scores) > 1 else 0
         answer_change = answer_scores[-1] - answer_scores[0] if len(answer_scores) > 1 else 0
-        weakest = min(answer_reviews, key=lambda item: (item['job_score'], item['answer_score']))
-        strongest = max(answer_reviews, key=lambda item: (item['job_score'], item['answer_score']))
 
-        progress = {
+        lowest_scored = min(answer_reviews, key=lambda item: (item['job_score'], item['answer_score']))
+        highest_scored = max(answer_reviews, key=lambda item: (item['job_score'], item['answer_score']))
+
+        score_flow = {
             'job_scores': job_scores,
             'answer_scores': answer_scores,
-            'job': {'first': job_scores[0], 'last': job_scores[-1], 'change': job_change, 'trend': _progress_label(job_change) if len(job_scores) > 1 else '비교 불가'},
-            'answer': {'first': answer_scores[0], 'last': answer_scores[-1], 'change': answer_change, 'trend': _progress_label(answer_change) if len(answer_scores) > 1 else '비교 불가'},
+            'job': {
+                'first': job_scores[0],
+                'last': job_scores[-1],
+                'change': job_change,
+                'direction': _score_flow_direction(job_change) if len(job_scores) > 1 else '비교 불가',
+            },
+            'answer': {
+                'first': answer_scores[0],
+                'last': answer_scores[-1],
+                'change': answer_change,
+                'direction': _score_flow_direction(answer_change) if len(answer_scores) > 1 else '비교 불가',
+            },
+            'interpretation_note': (
+                '각 질문의 난이도와 평가포인트가 다르므로 점수 변화만으로 지원자의 실력 향상·하락을 단정하지 않는다.'
+            ),
         }
+
         compact_reviews = [
-            {'turn_no': item['turn_no'], 'question_text': item['question_text'], 'job_score': item['job_score'], 'answer_score': item['answer_score'], 'strengths': item['strengths'], 'improvements': item['improvements']}
+            {
+                'turn_no': item['turn_no'],
+                'question_text': item['question_text'],
+                'job_score': item['job_score'],
+                'answer_score': item['answer_score'],
+                'strengths': item['strengths'],
+                'improvements': item['improvements'],
+            }
             for item in answer_reviews
         ]
+
         summary_prompt = f'''너는 심층 모의면접 종료 후 종합 코칭을 만드는 AI다.
-아래 답변별 분석 결과만 사용해 종합평가를 작성하라. 새로운 점수를 만들거나 합격 가능성을 추측하지 않는다.
-사용자가 몇 번째 답변에서 부족했고 어떻게 좋아졌는지 알 수 있게 변화 흐름을 반영한다.
+아래 데이터는 면접 진행 중 각 답변을 이미 한 번 평가해서 저장한 결과다.
+반드시 저장된 평가만 사용하고 답변을 다시 채점하거나 기존 점수를 수정하지 않는다.
+저장된 strengths와 improvements에 없는 새로운 전문 조건·평가기준·보완점을 임의로 추가하지 않는다.
+질문마다 난이도와 평가포인트가 다르므로 점수 상승·하락만으로 지원자의 실력이 향상 또는 하락했다고 단정하지 않는다.
+대신 몇 번째 답변에서 무엇이 부족했고, 이후 답변에서 어떤 내용이 더 구체화되었는지 저장된 분석에 근거해 설명한다.
 강점과 우선 보완점은 반복하지 말고 가장 중요한 내용 중심으로 작성한다.
-[기업] {self.company}\n[직무] {self.job}
+새로운 점수, 합격 가능성, 기업 내부 평가기준을 만들지 않는다.
+
+[기업] {self.company}
+[직무] {self.job}
 [종합 점수] 직무 {overall_job_score}, 답변 구성 {overall_answer_score}
-[변화 흐름]\n{json.dumps(progress, ensure_ascii=False)}
-[답변별 분석]\n{json.dumps(compact_reviews, ensure_ascii=False)}'''
+[답변별 점수 흐름]\n{json.dumps(score_flow, ensure_ascii=False)}
+[저장된 답변별 분석]\n{json.dumps(compact_reviews, ensure_ascii=False)}'''
+
         summary = self.deep_session_summary_llm.invoke(summary_prompt).model_dump()
+
+        lowest_payload = {
+            'turn_no': lowest_scored['turn_no'],
+            'job_score': lowest_scored['job_score'],
+            'answer_score': lowest_scored['answer_score'],
+            'improvements': lowest_scored['improvements'],
+        }
+        highest_payload = {
+            'turn_no': highest_scored['turn_no'],
+            'job_score': highest_scored['job_score'],
+            'answer_score': highest_scored['answer_score'],
+            'strengths': highest_scored['strengths'],
+        }
+
         return {
             'interview_type': 'DEEP_INTERVIEW',
             'scoring_version': SCORING_VERSION,
             'turn_count': len(answer_reviews),
-            'overall': {'job_score': overall_job_score, 'answer_score': overall_answer_score},
-            'progress': progress,
-            'weakest_turn': {'turn_no': weakest['turn_no'], 'job_score': weakest['job_score'], 'answer_score': weakest['answer_score'], 'improvements': weakest['improvements']},
-            'strongest_turn': {'turn_no': strongest['turn_no'], 'job_score': strongest['job_score'], 'answer_score': strongest['answer_score'], 'strengths': strongest['strengths']},
+            'analysis_reused': True,
+            'overall': {
+                'job_score': overall_job_score,
+                'answer_score': overall_answer_score,
+            },
+            'score_flow': score_flow,
+            # 기존 연동 코드 호환을 위해 progress 키도 같은 데이터를 반환한다.
+            'progress': copy.deepcopy(score_flow),
+            'lowest_scored_turn': lowest_payload,
+            'highest_scored_turn': highest_payload,
+            # 기존 연동 코드 호환용 키.
+            'weakest_turn': copy.deepcopy(lowest_payload),
+            'strongest_turn': copy.deepcopy(highest_payload),
             'summary': summary,
             'answer_reviews': answer_reviews,
         }
