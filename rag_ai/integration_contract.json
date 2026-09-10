@@ -9,21 +9,14 @@
     "question_text": "질문 텍스트",
     "question_reason": "공개자료 기반 질문 이유",
     "evaluation_points": ["평가포인트1", "평가포인트2", "평가포인트3"],
-    "rag_evidence": [
-      {
-        "source_title": "공식자료명",
-        "source_type": "official_job_posting",
-        "interview_type": "ALL",
-        "source_url": null,
-        "similarity": 0.82
-      }
-    ],
+    "rag_evidence": [],
     "practice_reason": null
   },
   "deep_followup_policy": {
     "max_followups": 3,
     "generation_mode": "SEQUENTIAL_AFTER_EACH_ANSWER",
-    "rule": "이전 답변에서 부족한 한 가지를 더 깊게 묻고 이미 확인한 내용은 반복하지 않는다"
+    "user_score_display_during_interview": false,
+    "rule": "각 답변의 부족한 한 가지를 더 깊게 묻고 이미 확인한 내용은 반복하지 않는다"
   },
   "deep_followup_request": {
     "current_question": {
@@ -44,30 +37,97 @@
   "deep_followup_response_example": {
     "question_type": "문제해결",
     "question_text": "꼬리질문 텍스트",
-    "question_reason": "현재 답변에서 추가 확인이 필요한 부분을 구체화하기 위한 이유",
+    "question_reason": "현재 답변에서 추가 확인이 필요한 이유",
     "evaluation_points": ["꼬리질문 평가포인트1", "꼬리질문 평가포인트2", "꼬리질문 평가포인트3"],
     "rag_evidence": [],
     "practice_reason": "지원자가 이 부분을 더 설명해야 하는 이유",
     "follow_up_no": 1,
     "max_followups": 3,
     "follow_up_question": "꼬리질문 텍스트",
-    "follow_up_reason": "현재 답변에서 추가 확인이 필요한 부분을 구체화하기 위한 이유"
+    "follow_up_reason": "현재 답변에서 추가 확인이 필요한 이유"
   },
   "answer_analysis_request": {
-    "question_data": "question_generation_response_example 또는 deep_followup_response_example과 동일 구조",
+    "question_data": "질문 또는 꼬리질문 데이터",
     "stt_text": "지원자 답변"
   },
   "answer_analysis_response_example": {
     "scoring_version": "v8_answer_base95_excellence5",
     "job_evaluation": "일부 드러남",
     "answer_evaluation": "잘 드러남",
-    "job_score": 67,
+    "job_score": 80,
     "answer_raw_score": 94,
     "answer_base_score": 89,
     "answer_excellence_bonus": 1.25,
     "answer_score": 90,
     "strengths": "가장 중요한 강점 1문장",
     "improvements": "가장 중요한 보완점 1문장"
+  },
+  "deep_session_analysis_request": {
+    "turns": [
+      {
+        "question_data": {
+          "question_type": "문제해결",
+          "question_text": "첫 질문 또는 꼬리질문",
+          "evaluation_points": ["평가포인트1", "평가포인트2", "평가포인트3"]
+        },
+        "stt_text": "해당 질문에 대한 지원자 답변"
+      }
+    ]
+  },
+  "deep_session_analysis_response_example": {
+    "interview_type": "DEEP_INTERVIEW",
+    "scoring_version": "v8_answer_base95_excellence5",
+    "turn_count": 4,
+    "overall": {
+      "job_score": 80,
+      "answer_score": 95
+    },
+    "progress": {
+      "job_scores": [60, 80, 80, 100],
+      "answer_scores": [90, 98, 98, 100],
+      "job": {
+        "first": 60,
+        "last": 100,
+        "change": 40,
+        "trend": "크게 향상"
+      },
+      "answer": {
+        "first": 90,
+        "last": 100,
+        "change": 10,
+        "trend": "향상"
+      }
+    },
+    "weakest_turn": {
+      "turn_no": 1,
+      "job_score": 60,
+      "answer_score": 90,
+      "improvements": "첫 답변에서 부족했던 핵심 보완점"
+    },
+    "strongest_turn": {
+      "turn_no": 4,
+      "job_score": 100,
+      "answer_score": 100,
+      "strengths": "마지막 답변의 핵심 강점"
+    },
+    "summary": {
+      "overall_summary": "심층면접 전체 종합평가",
+      "strengths": "전체 강점",
+      "priority_improvement": "가장 먼저 보완할 점",
+      "progress_summary": "답변이 어떻게 변화했는지 요약",
+      "next_practice_goal": "다음 연습목표"
+    },
+    "answer_reviews": [
+      {
+        "turn_no": 1,
+        "question_text": "첫 질문",
+        "job_score": 60,
+        "answer_score": 90,
+        "strengths": "이 답변의 강점",
+        "improvements": "이 답변의 보완점",
+        "analysis": "analyze_answer 전체 결과"
+      }
+    ]
   },
   "session_comparison": {
     "comparison_basis": "SELF_PREVIOUS_SESSION",
