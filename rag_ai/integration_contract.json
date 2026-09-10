@@ -20,30 +20,52 @@
     ],
     "practice_reason": null
   },
+  "deep_followup_policy": {
+    "max_followups": 3,
+    "generation_mode": "SEQUENTIAL_AFTER_EACH_ANSWER",
+    "rule": "이전 답변에서 부족한 한 가지를 더 깊게 묻고 이미 확인한 내용은 반복하지 않는다"
+  },
   "deep_followup_request": {
-    "question_data": {
+    "current_question": {
       "question_type": "문제해결",
-      "question_text": "첫 질문",
-      "evaluation_points": ["평가포인트1", "평가포인트2", "평가포인트3"]
+      "question_text": "현재 질문",
+      "evaluation_points": ["평가포인트1", "평가포인트2", "평가포인트3"],
+      "rag_evidence": []
     },
-    "stt_text": "지원자의 첫 답변 STT 텍스트"
+    "stt_text": "현재 질문에 대한 지원자 답변 STT 텍스트",
+    "follow_up_no": 1,
+    "previous_followups": [
+      {
+        "question_text": "이전에 생성된 꼬리질문",
+        "stt_text": "그 꼬리질문에 대한 지원자 답변"
+      }
+    ]
   },
   "deep_followup_response_example": {
     "question_type": "문제해결",
     "question_text": "꼬리질문 텍스트",
-    "question_reason": "첫 답변에서 추가 확인이 필요한 부분을 구체화하기 위한 심층 꼬리질문",
-    "evaluation_points": ["평가포인트1", "평가포인트2", "평가포인트3"],
-    "practice_reason": "첫 답변에서 구체화가 필요한 부분"
+    "question_reason": "현재 답변에서 추가 확인이 필요한 부분을 구체화하기 위한 이유",
+    "evaluation_points": ["꼬리질문 평가포인트1", "꼬리질문 평가포인트2", "꼬리질문 평가포인트3"],
+    "rag_evidence": [],
+    "practice_reason": "지원자가 이 부분을 더 설명해야 하는 이유",
+    "follow_up_no": 1,
+    "max_followups": 3,
+    "follow_up_question": "꼬리질문 텍스트",
+    "follow_up_reason": "현재 답변에서 추가 확인이 필요한 부분을 구체화하기 위한 이유"
   },
   "answer_analysis_request": {
-    "question_data": "question_generation_response_example과 동일 구조",
+    "question_data": "question_generation_response_example 또는 deep_followup_response_example과 동일 구조",
     "stt_text": "지원자 답변"
   },
   "answer_analysis_response_example": {
+    "scoring_version": "v8_answer_base95_excellence5",
     "job_evaluation": "일부 드러남",
     "answer_evaluation": "잘 드러남",
     "job_score": 67,
-    "answer_score": 88,
+    "answer_raw_score": 94,
+    "answer_base_score": 89,
+    "answer_excellence_bonus": 1.25,
+    "answer_score": 90,
     "strengths": "가장 중요한 강점 1문장",
     "improvements": "가장 중요한 보완점 1문장"
   },
