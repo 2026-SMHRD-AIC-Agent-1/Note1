@@ -19,13 +19,16 @@ JOB_DEFAULT = 'System Architecture / Software Solution'
 INTERVIEW_TYPES = ('AISK', 'DEEP_INTERVIEW')
 QUESTION_TYPES = ('직무이해', '문제해결', '협업')
 
-# 답변 평가 점수체계 v7:
-# 1) 직무평가 공통 세부조건을 6개 -> 5개로 정리한다.
-# 2) 답변 구성 100점은 기본 체크가 모두 True여도 별도의 우수답변 조건 4개를 모두 충족해야 한다.
-# 3) LLM은 충족 여부만 판단하고 Python이 실제 점수를 계산한다.
-SCORING_VERSION = 'v7_five_job_subchecks_strict_answer_100'
+# 답변 평가 점수체계 v8:
+# 1) 직무평가 공통 세부조건은 5개를 유지한다.
+# 2) 답변 구성 기본평가는 최대 95점, 우수답변 조건은 최대 +5점으로 계산한다.
+# 3) 모든 답변이 기본평가와 우수답변 조건을 함께 평가받으며, LLM은 True/False만 판단한다.
+SCORING_VERSION = 'v8_answer_base95_excellence5'
 JOB_MAX_LEVEL = 5
 ANSWER_MAX_LEVEL = 4
+
+ANSWER_BASE_MAX_SCORE = 95
+ANSWER_EXCELLENCE_MAX_BONUS = 5
 
 # job_scope:
 # - ALL: 모든 직무에서 사용할 회사/면접 공통자료
@@ -245,11 +248,52 @@ def _qualitative_label(levels: List[int], max_level: int) -> str:
     return '보완 필요'
 
 
-def _answer_score_v7(answer_levels: List[int], excellence_checks: List[bool]) -> int:
-    raw_score = _score_from_levels(answer_levels, ANSWER_MAX_LEVEL)
-    if raw_score < 100:
-        return raw_score
-    return 100 if all(excellence_checks[:4]) else 95
+def _round_half_up(value: float) -> int:
+    return int(value + 0.5)
+
+
+def _answer_score_v8(
+    answer_levels: List[int],
+    excellence_checks: List[bool],
+) -> Dict[str, Any]:
+    # 기본 구성평가: 최대 95점
+    total_basic_checks = len(answer_levels) * ANSWER_MAX_LEVEL
+    passed_basic_checks = sum(answer_levels)
+
+    if total_basic_checks == 0:
+        base_exact = 0.0
+    else:
+        base_exact = (
+            passed_basic_checks
+            / total_basic_checks
+            * ANSWER_BASE_MAX_SCORE
+        )
+
+    # 우수답변 조건: 최대 +5점
+    excellence_count = sum(
+        1 for value in excellence_checks[:4] if value
+    )
+
+    excellence_bonus = (
+        excellence_count
+        / 4
+        * ANSWER_EXCELLENCE_MAX_BONUS
+    )
+
+    final_score = min(
+        100,
+        _round_half_up(base_exact + excellence_bonus)
+    )
+
+    return {
+        'base_score': _round_half_up(base_exact),
+        'excellence_bonus': round(excellence_bonus, 2),
+        'final_score': final_score,
+        'perfect_eligible': (
+            passed_basic_checks == total_basic_checks
+            and excellence_count == 4
+        ),
+    }
 
 
 class RagInterviewAI:
@@ -563,7 +607,7 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 [답변 구성 기준과 각 세부조건]
 {json.dumps(ANSWER_STRUCTURE_SUBCHECKS, ensure_ascii=False)}
 
-[답변 구성 100점 전용 우수답변 조건 - 반드시 이 순서로 4개]
+[답변 구성 우수성 보너스 조건 - 반드시 이 순서로 4개]
 {json.dumps(ANSWER_EXCELLENCE_LABELS, ensure_ascii=False)}
 
 [STT 답변]
@@ -573,10 +617,17 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 - 점수나 레벨을 직접 선택하지 않는다.
 - 직무 평가포인트 3개 각각에 대해 세부조건 5개를 순서대로 True/False로만 판단한다.
 - 답변 구성 기준 4개 각각에 대해 해당 기준의 세부조건 4개를 순서대로 True/False로만 판단한다.
-- 마지막으로 답변 구성 100점 전용 우수답변 조건 4개를 별도로 True/False 판단한다.
+- 마지막으로 답변 구성 우수성 보너스 조건 4개를 별도로 True/False 판단한다.
 - STT 답변에 실제로 드러난 내용만 근거로 판단하고, 말하지 않은 직무지식·경험은 추측하지 않는다.
 - 단순히 관련 전문용어가 있다는 이유만으로 여러 직무 세부조건을 동시에 True로 만들지 않는다.
 - 직무 세부조건의 True는 답변 안에 그 조건을 뒷받침하는 내용이 실제로 있을 때만 선택한다.
+- 직무 평가포인트 3개는 서로 독립적으로 판단한다.
+- 한 평가포인트에서 인정한 좋은 설명을 다른 평가포인트의 충족 근거로 자동 재사용하지 않는다.
+- 측정→분석→최적화→검증 같은 일반적인 문제해결 절차만으로 서로 다른 평가포인트를 모두 높게 평가하지 않는다.
+- 각 평가포인트에만 있는 핵심 요구요소가 답변에서 실제로 다뤄졌는지 먼저 확인한다.
+- 평가포인트가 '실제 AI 워크로드', '차세대 메모리', 'HW-SW', '협업' 등 특정 조건을 포함하면 그 조건과 답변 내용이 직접 연결되어야 한다.
+- 특정 평가포인트의 핵심 요구요소가 빠졌다면 다른 평가포인트의 좋은 설명으로 대신 충족시키지 않는다.
+- 1번째 직무 세부조건은 관련 단어를 단순 언급하는 것만으로는 부족하며 평가포인트의 핵심 요구에 실제로 답해야 True다.
 - 2번째 직무 세부조건은 단순 정의만 있으면 부족하다. 질문에 필요한 의미·이유·원인·영향·관계 중 적절한 논리 연결이 실제로 설명되어야 True다.
 - 3번째 직무 세부조건은 판단 기준·근거·지표·사례 중 해당 평가항목에 자연스럽게 맞는 것이 하나 이상 구체적으로 드러나야 True다.
 - 5번째 직무 세부조건은 기술 질문에서는 재측정·검증, 경험 질문에서는 결과·성과·학습·후속 적용처럼 질문 성격에 맞게 판단한다.
@@ -591,8 +642,8 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 - '명료하고 일관되게 전달하는가'는 답변 전체를 보고 반복·장황함·문장 연결·핵심 파악 용이성을 판단한다.
 - 짧다는 이유만으로 기본 구성평가를 낮추지 않는다. 짧아도 직접적이고 논리적이며 이해 가능하면 기본 구성점수는 높을 수 있다.
 
-[100점 전용 우수답변 조건은 엄격하게 판단한다]
-- 이 4개 조건은 정말 완성도 높은 답변에만 100점을 허용하기 위한 조건이다.
+[우수답변 보너스 조건은 엄격하게 판단한다]
+- 이 4개 조건은 기본 구성평가와 별도로 높은 답변 완성도를 보상하기 위한 조건이다.
 - 기본 구성 체크가 모두 True라는 이유만으로 우수답변 조건도 자동으로 True로 만들지 않는다.
 - 단순히 짧고 오류가 없거나, 반복·모순이 없다는 이유만으로 우수답변 조건을 True로 만들지 않는다.
 - 1번째 조건은 핵심 결론·입장·접근 방향이 답변 초반부터 명확하고 답변 전체가 그 중심을 유지할 때만 True다.
@@ -603,7 +654,7 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
 
 - 신입 지원자에게 실제 현업 경험이나 회사 내부 수치를 요구하지 않는다.
 - 각 평가항목마다 전체 판단 이유를 한 문장으로 반환한다.
-- answer_excellence_reason에는 100점 자격을 충족하거나 충족하지 못한 핵심 이유를 한 문장으로 반환한다.
+- answer_excellence_reason에는 우수성 보너스 조건을 얼마나 충족했는지 핵심 이유를 한 문장으로 반환한다.
 - strengths와 improvements는 체크 결과에 근거해 작성한다.
 - 합격/불합격, 기업 내부 채점기준, 성격·감정·자신감은 추측하지 않는다.
 '''
@@ -619,7 +670,11 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
         ]
         excellence_checks = list(result.answer_excellence_checks)
         raw_answer_score = _score_from_levels(answer_levels, ANSWER_MAX_LEVEL)
-        answer_score = _answer_score_v7(answer_levels, excellence_checks)
+        answer_score_result = _answer_score_v8(
+            answer_levels,
+            excellence_checks,
+        )
+        answer_score = answer_score_result['final_score']
 
         return {
             'scoring_version': SCORING_VERSION,
@@ -628,7 +683,9 @@ PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
             'job_score': _score_from_levels(job_levels, JOB_MAX_LEVEL),
             'answer_score': answer_score,
             'answer_raw_score': raw_answer_score,
-            'answer_perfect_eligible': all(excellence_checks[:4]),
+            'answer_base_score': answer_score_result['base_score'],
+            'answer_excellence_bonus': answer_score_result['excellence_bonus'],
+            'answer_perfect_eligible': answer_score_result['perfect_eligible'],
             'answer_excellence_checks': excellence_checks,
             'answer_excellence_labels': ANSWER_EXCELLENCE_LABELS,
             'answer_excellence_reason': result.answer_excellence_reason,
