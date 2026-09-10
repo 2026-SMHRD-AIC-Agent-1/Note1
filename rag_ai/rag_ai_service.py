@@ -18,6 +18,7 @@ COMPANY_DEFAULT = 'SK하이닉스'
 JOB_DEFAULT = 'System Architecture / Software Solution'
 INTERVIEW_TYPES = ('AISK', 'DEEP_INTERVIEW')
 QUESTION_TYPES = ('직무이해', '문제해결', '협업')
+DEEP_MAX_FOLLOWUPS = 3
 
 # 답변 평가 점수체계 v8:
 # 1) 직무평가 공통 세부조건은 5개를 유지한다.
@@ -151,6 +152,8 @@ class QuestionSet(BaseModel):
 class DeepFollowUpDraft(BaseModel):
     follow_up_question: str
     follow_up_reason: str
+    evaluation_points: List[str] = Field(min_length=3, max_length=3)
+    practice_reason: str
 
 
 class JobCriterionChecklist(BaseModel):
@@ -543,25 +546,78 @@ evaluation_points는 정확히 3개다.
         self,
         current_question: Dict[str, Any],
         stt_text: str,
-    ) -> Dict[str, str]:
+        follow_up_no: int = 1,
+        previous_followups: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        if not 1 <= follow_up_no <= DEEP_MAX_FOLLOWUPS:
+            raise ValueError(
+                f'follow_up_no는 1~{DEEP_MAX_FOLLOWUPS}만 가능합니다.'
+            )
+
+        previous_followups = previous_followups or []
+        history_lines: List[str] = []
+        for i, item in enumerate(previous_followups, 1):
+            previous_question = (
+                item.get('question_text')
+                or item.get('follow_up_question')
+                or ''
+            )
+            previous_answer = item.get('stt_text') or item.get('answer') or ''
+            history_lines.append(
+                f'{i}차 꼬리질문: {previous_question}\n'
+                f'{i}차 답변: {previous_answer}'
+            )
+        history_text = '\n\n'.join(history_lines) if history_lines else '없음'
+
         prompt = f'''
 너는 기업·직무 심층면접의 꼬리질문 생성 AI다.
+현재 심층면접에서는 첫 질문 이후 꼬리질문을 최대 {DEEP_MAX_FOLLOWUPS}개까지 순차적으로 생성한다.
+
+[이번 꼬리질문 번호]
+{follow_up_no}/{DEEP_MAX_FOLLOWUPS}
+
+[이전 꼬리질문/답변 기록]
+{history_text}
 
 [현재 질문]
 {current_question['question_text']}
 
-[공개자료 기반 평가포인트]
+[현재 질문의 평가포인트]
 {json.dumps(current_question.get('evaluation_points', []), ensure_ascii=False)}
 
 [지원자 STT 답변]
 {stt_text}
 
-답변에서 더 구체적으로 확인할 한 가지를 골라 꼬리질문을 정확히 1개 생성하라.
-이미 충분히 설명된 내용을 반복하지 말고 현재 질문과 평가포인트 범위를 벗어나지 않는다.
-기업 내부 평가기준과 합격 가능성은 추측하지 않는다.
-PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
+현재 답변에서 아직 충분히 설명되지 않은 한 가지 핵심을 골라 꼬리질문을 정확히 1개 생성하라.
+꼬리질문에 대한 evaluation_points도 정확히 3개 생성하라.
+practice_reason에는 지원자가 왜 이 부분을 더 설명해야 하는지 한 문장으로 작성하라.
+
+반드시 다음 규칙을 지켜라.
+- 이미 충분히 설명된 내용을 반복해서 묻지 않는다.
+- 이전 꼬리질문에서 이미 확인한 내용을 다시 묻지 않는다.
+- 현재 질문과 평가포인트의 범위를 벗어나 새로운 직무영역을 임의로 추가하지 않는다.
+- 지원자가 말하지 않은 경험이나 회사 내부정보를 전제로 질문하지 않는다.
+- 1차 꼬리질문은 빠진 기준·지표·근거·구체적 방법을 우선 확인한다.
+- 2차 꼬리질문은 앞선 답변에서 드러난 판단 논리, 원인관계, 선택 기준 또는 트레이드오프를 더 깊게 확인한다.
+- 3차 꼬리질문은 검증 방법, 우선순위, 대안, 한계 또는 후속 조치 중 아직 부족한 한 가지를 확인한다.
+- 꼬리질문 평가포인트 3개는 해당 꼬리질문에 직접 답했는지를 평가할 수 있도록 구체적으로 작성한다.
+- 기업 내부 평가기준과 합격 가능성은 추측하지 않는다.
 '''
-        return self.deep_followup_llm.invoke(prompt).model_dump()
+        draft = self.deep_followup_llm.invoke(prompt)
+
+        return {
+            'question_type': current_question.get('question_type', '문제해결'),
+            'question_text': draft.follow_up_question,
+            'question_reason': draft.follow_up_reason,
+            'evaluation_points': draft.evaluation_points[:3],
+            'rag_evidence': copy.deepcopy(current_question.get('rag_evidence', [])),
+            'practice_reason': draft.practice_reason,
+            'follow_up_no': follow_up_no,
+            'max_followups': DEEP_MAX_FOLLOWUPS,
+            # 기존 연동 코드와의 호환성을 위해 기존 키도 함께 유지한다.
+            'follow_up_question': draft.follow_up_question,
+            'follow_up_reason': draft.follow_up_reason,
+        }
 
     def _analysis_cache_key(
         self,
