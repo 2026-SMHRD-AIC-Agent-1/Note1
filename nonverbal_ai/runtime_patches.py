@@ -1,11 +1,28 @@
 """Runtime corrections for the preserved nonverbal analyzer.
 
 The original source in `_source_parts/` is kept intact. The wrapper loads this file
-after the original module so these corrected functions override the originals.
+after the original module so these corrected functions/constants override the
+preserved source without rewriting the large original file.
 """
 from __future__ import annotations
 
 import re
+
+
+# --------------------------------------------------------------------
+# A!SK V1 policy confirmed 2026-09-14
+# --------------------------------------------------------------------
+# Visual calibration: 3 seconds of stable framing around the screen-center target.
+CALIBRATION_CLIP_DURATION_SEC = 3.0
+CALIBRATION_SCRIPT_TEXT = "안녕하세요. 지금부터 면접을 시작하겠습니다."
+
+# Meaningful gaze deviation: 1 second or longer.
+GAZE_EPISODE_CONFIG = EpisodeConfig(min_exceed_duration_sec=1.0, min_return_duration_sec=0.15)
+
+# Posture is evaluated as sustained deviation, not brief natural movement.
+# Head direction and body/shoulder movement therefore share a 2-second minimum.
+FACE_EPISODE_CONFIG = EpisodeConfig(min_exceed_duration_sec=2.0, min_return_duration_sec=0.3)
+BODY_MOVEMENT_EPISODE_CONFIG = EpisodeConfig(min_exceed_duration_sec=2.0, min_return_duration_sec=0.3)
 
 
 def analyze_gaze_direction(series, calibration=None):
@@ -14,6 +31,9 @@ def analyze_gaze_direction(series, calibration=None):
     Iris mode excludes frames whose EAR is below MIN_EAR_FOR_GAZE_CHECK from
     gaze-ratio denominators. Head-pose approximation uses yaw, so EAR does not
     gate those frames. `gaze_valid_frame_ratio` is returned for QA/gating.
+
+    A!SK V1 additionally requires an actual deviation episode to persist for at
+    least 1 second; the global GAZE_EPISODE_CONFIG above enforces that policy.
     """
     if series.gaze_is_approx:
         source_values = series.yaw
@@ -70,7 +90,7 @@ def _normalize_stt_token(token):
 
 
 def count_filler_words(stt_text, filler_words=None, word_timestamps=None, total_duration_sec=None):
-    """Count fillers as standalone STT tokens, not substrings inside other words."""
+    """Count internal filler tokens exactly; user-facing reports call them hesitation expressions."""
     filler_words = filler_words or DEFAULT_FILLER_WORDS
     filler_set = set(filler_words)
 
