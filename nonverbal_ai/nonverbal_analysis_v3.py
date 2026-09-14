@@ -33,3 +33,9 @@ if _actual_sha256 != _EXPECTED_SHA256:
     )
 
 exec(compile(_SOURCE, str(Path(__file__).with_name("nonverbal_analysis_v3_original.py")), "exec"), globals(), globals())
+
+# 45개 파일럿 검토에서 확인된 계산 오류는 원본 보존과 분리해 런타임 패치로 적용한다.
+_PATCH_FILE = Path(__file__).resolve().parent / "runtime_patches.py"
+if _PATCH_FILE.exists():
+    _PATCH_SOURCE = _PATCH_FILE.read_text(encoding="utf-8")
+    exec(compile(_PATCH_SOURCE, str(_PATCH_FILE), "exec"), globals(), globals())
