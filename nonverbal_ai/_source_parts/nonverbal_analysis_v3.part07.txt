@@ -1,0 +1,87 @@
+            "pitch_variation": ..., "filler_word_count": ...,
+            "voice_emotion_label": None,  # 항상 None. 평가 제외 항목이라 값 생성 안 함.
+        }
+
+    [주의]
+        - 애매한 매핑은 DB_FIELD_MAPPING_NOTES에 이유를 적어뒀음. 팀 합의로 바뀌면 여기만 수정.
+        - head_nod_count는 nod_count와 shake_count를 합산함 -> 방향 구분이 사라짐.
+          shake_count가 0이 아니면 경고를 출력해서, 젓기 동작이 있었다는 걸 놓치지 않게 함.
+        - voice_emotion_label은 측정기준정의서상 "평가 제외" 항목이므로 값을 만들지 않고
+          항상 None으로 둠. 화면/코칭에 노출하지 말 것.
+    """
+    nod = result.get("nod_count", 0)
+    shake = result.get("shake_count", 0)
+    if shake > 0:
+        print(f"[경고] shake_count={shake}로 감지됐지만 head_nod_count 필드 하나에 합쳐집니다. "
+              f"고개를 저은 정보가 DB에서 구분되지 않습니다 - Backend와 필드 분리 여부 확인 필요.")
+
+    return {
+        "face_yaw": result.get("face_yaw"),
+        "gaze_center_ratio": result.get("gaze_center_ratio"),
+        "blink_rate": result.get("blink_per_min"),
+        "smile_intensity": result.get("smile_avg_intensity"),
+        "expression_change_count": result.get("expression_change_count"),
+        "upper_body_sway": result.get("body_movement_score"),
+        "head_nod_count": nod + shake,
+        "hand_gesture_rate": result.get("gesture_per_min"),
+        "pause_count": result.get("pause_count"),
+        "average_volume": result.get("mean_db"),
+        "speaking_speed": result.get("speaking_speed"),
+        "pitch_variation": result.get("f0_std"),
+        "filler_word_count": result.get("filler_word_count"),
+        "voice_emotion_label": None,  # 평가 제외 - 값 생성하지 않음
+    }
+
+
+def _test_map_to_db_fields():
+    """더미 결과로 매핑 함수가 정확히 14개 필드를 만드는지, shake 경고가 뜨는지 확인."""
+    dummy_result = {
+        "face_yaw": 2.3, "gaze_center_ratio": 0.82,
+        "blink_per_min": 21.6, "smile_avg_intensity": 0.21,
+        "expression_change_count": 5,
+        "body_movement_score": 0.045,
+        "nod_count": 3, "shake_count": 1,   # shake_count > 0 -> 경고 떠야 함
+        "gesture_per_min": 4.8,
+        "pause_count": 5, "mean_db": -18.4, "speaking_speed": 118.4,
+        "f0_std": 24.6, "filler_word_count": 6,
+    }
+    mapped = map_to_db_fields(dummy_result)
+    print("[PASS] map_to_db_fields 결과:", mapped)
+    assert len(mapped) == 14
+    assert mapped["head_nod_count"] == 4  # 3(nod)+1(shake)
+    assert mapped["voice_emotion_label"] is None
+
+
+# ====================================================================
+# 11. 단위 테스트 (mediapipe/librosa 없이, 합성 데이터로 로직만 검증)
+# ====================================================================
+
+if __name__ == "__main__":
+    _test_detect_episodes()
+    _test_blink_logic()
+    _test_smile_logic()
+    _test_nod_shake_logic()
+    _test_speaking_speed_and_filler()
+    _test_filler_episode_with_timestamps()
+    _test_body_movement_logic()
+    _test_median()
+    _test_calibration_profile_valid()
+    _test_calibration_profile_invalid_low_detection()
+    _test_compute_pose_deviations_with_calibration()
+    _test_amplitude_to_db()
+    _test_check_audio_quality_normal()
+    _test_check_audio_quality_mic_silent()
+    _test_check_audio_quality_too_noisy()
+    _test_check_audio_quality_low_snr()
+    _test_gaze_direction_approx_mode()
+    _test_voice_calibration_profile()
+    _test_voice_calibration_profile_no_voice()
+    _test_voice_relative_metrics()
+    _test_extract_event_log()
+    _test_map_to_db_fields()
+    print("\n모든 로직 테스트 통과 (mediapipe/librosa 불필요, 합성 데이터 기준)")
+
+    # 실제 영상/오디오로 테스트하려면:
+    # result = analyze_video("sample.mp4", audio_path="sample.wav", stt_text="...")
+    # db_ready = map_to_db_fields(result)
+    # print(json.dumps(db_ready, ensure_ascii=False, indent=2))
