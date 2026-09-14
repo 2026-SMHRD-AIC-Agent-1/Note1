@@ -97,12 +97,55 @@ def build_delivery_profile(
 
     posture_score_candidate = bool(_get(nonverbal_features, "measurement", "posture_score_candidate", default=False))
     posture_status = _get(nonverbal_features, "head_posture_stability", "status", default="reference_only_uncalibrated")
+    posture_values = (
+        _get(nonverbal_features, "head_posture_stability", "face_deviation_per_min_reference"),
+        _get(nonverbal_features, "head_posture_stability", "face_deviation_time_ratio_reference"),
+        _get(nonverbal_features, "head_posture_stability", "body_movement_per_min_reference"),
+        _get(nonverbal_features, "head_posture_stability", "body_movement_time_ratio_reference"),
+    )
+    posture_available = any(value is not None for value in posture_values)
 
     speech_habits = stt_features.get("speech_habits_report")
     if not isinstance(speech_habits, dict):
         speech_habits = _fallback_speech_habits(stt_features, language_analysis_allowed)
     if not language_analysis_allowed:
         speech_habits = _fallback_speech_habits(stt_features, False)
+
+    gaze_component = {
+        **_status(gaze_available, score_eligible=gaze_score_candidate, reason=None if gaze_score_candidate else "successful iris calibration required"),
+        "gaze_status": gaze_status,
+        "gaze_valid_frame_ratio": _get(nonverbal_features, "measurement", "gaze_valid_frame_ratio"),
+        "center_ratio": _get(nonverbal_features, "gaze_stability", "center_ratio") if gaze_score_candidate else None,
+        "deviation_per_min": _get(nonverbal_features, "gaze_stability", "deviation_per_min") if gaze_score_candidate else None,
+        "deviation_time_ratio": _get(nonverbal_features, "gaze_stability", "deviation_time_ratio") if gaze_score_candidate else None,
+        "meaningful_deviation_min_sec": 1.0,
+        "reference": {
+            "iris_center_ratio": _get(nonverbal_features, "gaze_stability", "iris_center_ratio_reference"),
+            "iris_deviation_per_min": _get(nonverbal_features, "gaze_stability", "iris_deviation_per_min_reference"),
+            "head_pose_deviation_per_min": _get(nonverbal_features, "gaze_stability", "approx_deviation_per_min"),
+        },
+    }
+
+    posture_component = {
+        **_status(
+            posture_available,
+            score_eligible=posture_score_candidate,
+            reason=None if posture_score_candidate else "successful calibration required",
+        ),
+        "status": posture_status,
+        "signals": ["head_direction", "shoulder_tilt", "upper_body_position"],
+        "face_deviation_per_min": _get(nonverbal_features, "head_posture_stability", "face_deviation_per_min") if posture_score_candidate else None,
+        "face_deviation_time_ratio": _get(nonverbal_features, "head_posture_stability", "face_deviation_time_ratio") if posture_score_candidate else None,
+        "body_movement_per_min": _get(nonverbal_features, "head_posture_stability", "body_movement_per_min") if posture_score_candidate else None,
+        "body_movement_time_ratio": _get(nonverbal_features, "head_posture_stability", "body_movement_time_ratio") if posture_score_candidate else None,
+        "meaningful_deviation_min_sec": 2.0,
+        "reference": {
+            "face_deviation_per_min": posture_values[0],
+            "face_deviation_time_ratio": posture_values[1],
+            "body_movement_per_min": posture_values[2],
+            "body_movement_time_ratio": posture_values[3],
+        },
+    }
 
     return {
         "version": VERSION,
@@ -142,36 +185,10 @@ def build_delivery_profile(
                 "average_volume_db_reference": _get(nonverbal_features, "voice_stability", "average_volume_db_reference") if voice_available else None,
                 "scoring_rule": "use within-answer variation; calibration/base loudness is report reference only",
             },
-            "gaze_stability": {
-                **_status(gaze_available, score_eligible=gaze_score_candidate, reason=None if gaze_score_candidate else "successful iris calibration required"),
-                "gaze_status": gaze_status,
-                "gaze_valid_frame_ratio": _get(nonverbal_features, "measurement", "gaze_valid_frame_ratio"),
-                "center_ratio": _get(nonverbal_features, "gaze_stability", "center_ratio") if gaze_score_candidate else None,
-                "deviation_per_min": _get(nonverbal_features, "gaze_stability", "deviation_per_min") if gaze_score_candidate else None,
-                "deviation_time_ratio": _get(nonverbal_features, "gaze_stability", "deviation_time_ratio") if gaze_score_candidate else None,
-                "meaningful_deviation_min_sec": 1.0,
-                "reference": {
-                    "iris_center_ratio": _get(nonverbal_features, "gaze_stability", "iris_center_ratio_reference"),
-                    "iris_deviation_per_min": _get(nonverbal_features, "gaze_stability", "iris_deviation_per_min_reference"),
-                    "head_pose_deviation_per_min": _get(nonverbal_features, "gaze_stability", "approx_deviation_per_min"),
-                },
-            },
-            "posture_stability": {
-                **_status(True, score_eligible=posture_score_candidate, reason=None if posture_score_candidate else "successful calibration required"),
-                "status": posture_status,
-                "signals": ["head_direction", "shoulder_tilt", "upper_body_position"],
-                "face_deviation_per_min": _get(nonverbal_features, "head_posture_stability", "face_deviation_per_min") if posture_score_candidate else None,
-                "face_deviation_time_ratio": _get(nonverbal_features, "head_posture_stability", "face_deviation_time_ratio") if posture_score_candidate else None,
-                "body_movement_per_min": _get(nonverbal_features, "head_posture_stability", "body_movement_per_min") if posture_score_candidate else None,
-                "body_movement_time_ratio": _get(nonverbal_features, "head_posture_stability", "body_movement_time_ratio") if posture_score_candidate else None,
-                "meaningful_deviation_min_sec": 2.0,
-                "reference": {
-                    "face_deviation_per_min": _get(nonverbal_features, "head_posture_stability", "face_deviation_per_min_reference"),
-                    "face_deviation_time_ratio": _get(nonverbal_features, "head_posture_stability", "face_deviation_time_ratio_reference"),
-                    "body_movement_per_min": _get(nonverbal_features, "head_posture_stability", "body_movement_per_min_reference"),
-                    "body_movement_time_ratio": _get(nonverbal_features, "head_posture_stability", "body_movement_time_ratio_reference"),
-                },
-            },
+            "gaze_stability": gaze_component,
+            "posture_stability": posture_component,
+            # Backward-compatible key retained for any existing consumer.
+            "head_posture_stability": posture_component,
         },
         "report_only": {
             "speech_habits": speech_habits,
