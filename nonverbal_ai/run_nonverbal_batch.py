@@ -1,10 +1,12 @@
 """45개 파일럿 영상용 비언어 + 기존 STT 통합 배치 실행기.
 
 - 영상에서 ffmpeg로 16kHz mono WAV를 추출합니다.
-- 기존 STT JSON의 text/word timestamp를 재사용합니다. (STT API 재호출 없음)
+- 기존 STT JSON의 text/word timestamp/stability_features를 재사용합니다. (STT API 재호출 없음)
 - nonverbal_analysis_v3.analyze_video()를 실행합니다.
-- stability_features.derive_stability_features()로 측정상태/정규화 지표를 함께 저장합니다.
-- 오디오 이상은 0점으로 바꾸지 않고 measurement_unavailable 상태를 보존합니다.
+- stability_features.derive_stability_features()로 측정상태/정규화 지표를 저장합니다.
+- delivery_stability_v1.build_delivery_profile()로 STT+비언어 통합 리포트 입력을 만듭니다.
+- 오디오 이상은 0점으로 바꾸지 않고 measurement_unavailable 상태를 보존하며,
+  해당 STT는 언어/전달 점수 입력으로 사용하지 않도록 표시합니다.
 
 예시:
   python run_nonverbal_batch.py --input-root "C:/pilot/videos" --stt-root "C:/pilot/stt_results" --audio-root "C:/pilot/audio" --output-dir "C:/pilot/nonverbal_results" --people 교민 --videos 1
@@ -21,6 +23,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 import nonverbal_analysis_v3 as nonverbal
+from delivery_stability_v1 import build_delivery_profile
 from stability_features import derive_stability_features
 
 VIDEO_RE = re.compile(r"video_(\d+)\.mp4$", re.IGNORECASE)
@@ -141,6 +144,9 @@ def main():
 
             duration_sec = stt_payload.get("duration_sec")
             features = derive_stability_features(raw, duration_sec=duration_sec)
+            stt_features = stt_payload.get("stability_features") or {}
+            delivery_profile = build_delivery_profile(raw, features, stt_features)
+
             audio_status = features.get("measurement", {}).get("audio_status")
             if audio_status == "measurement_unavailable":
                 unavailable_audio += 1
@@ -151,10 +157,14 @@ def main():
                 "source_file": video_path.name,
                 "audio_file": str(wav_path),
                 "stt_source_file": str(stt_path),
+                # Raw STT is preserved for audit. Whether it may feed language/scoring
+                # is controlled by delivery_profile.measurement.language_analysis_allowed.
                 "stt_text": stt_payload.get("text", ""),
                 "stt_duration_sec": duration_sec,
+                "stt_stability_features": stt_features,
                 "raw_nonverbal": raw,
                 "stability_features": features,
+                "delivery_profile_v1": delivery_profile,
             }
             out_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2, default=json_default),
@@ -164,7 +174,11 @@ def main():
                 err_path.unlink()
 
             gaze_status = features.get("measurement", {}).get("gaze_status")
-            print(f"[OK] {person} video_{video_num} | audio={audio_status} | gaze={gaze_status}")
+            lang_allowed = delivery_profile.get("measurement", {}).get("language_analysis_allowed")
+            print(
+                f"[OK] {person} video_{video_num} | audio={audio_status} "
+                f"| gaze={gaze_status} | language_analysis_allowed={lang_allowed}"
+            )
             completed += 1
         except Exception as exc:  # noqa: BLE001
             err_payload = {
