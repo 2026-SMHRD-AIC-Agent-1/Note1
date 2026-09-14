@@ -1,0 +1,337 @@
+        data_source = "head_pose_approx"
+    else:
+        source_values = series.gaze_ratio
+        baseline = calibration.gaze_baseline if calibration is not None else compute_baseline(series.timestamps, source_values)
+        threshold = GAZE_DEVIATION_RATIO_THRESHOLD
+        data_source = "iris"
+
+    dev = [
+        (v - baseline) if ear_v >= MIN_EAR_FOR_GAZE_CHECK else 0.0
+        for v, ear_v in zip(source_values, series.ear)
+    ]
+
+    def is_dev(v):
+        return abs(v) >= threshold
+
+    episodes = detect_episodes(series.timestamps, dev, is_dev, GAZE_EPISODE_CONFIG)
+    count, total_sec = summarize_episodes(episodes)
+
+    def _direction_value(e: Episode) -> str:
+        v = _value_at(series.timestamps, dev, e.start_sec)
+        return "right" if v >= 0 else "left"
+
+    n = len(dev)
+    return {
+        "gaze_center_ratio": round(sum(1 for v in dev if not is_dev(v)) / n, 3),
+        "gaze_left_ratio": round(sum(1 for v in dev if v <= -threshold) / n, 3),
+        "gaze_right_ratio": round(sum(1 for v in dev if v >= threshold) / n, 3),
+        "gaze_deviation_count": count,
+        "gaze_deviation_total_sec": round(total_sec, 2),
+        "gaze_events": _episodes_to_events(episodes, EVENT_TYPE_GAZE_AWAY, value_fn=_direction_value),
+        "gaze_data_source": data_source,
+    }
+
+
+# --- 3-3. 눈 깜빡임 ---
+
+BLINK_EAR_RATIO_THRESHOLD = 0.7  # baseline 대비 70% 이하면 감음 후보
+BLINK_EPISODE_CONFIG = EpisodeConfig(min_exceed_duration_sec=0.03, min_return_duration_sec=0.03)
+LONG_BLINK_THRESHOLD_SEC = 0.5
+
+
+def analyze_blink(series: FaceMeshSeries, calibration: Optional[CalibrationProfile] = None) -> dict:
+    """[출력] blink_count_total, blink_per_min, long_blink_count,
+    blink_events(LONG_BLINK 리스트 - 일반 눈깜빡임은 너무 잦아 이벤트로 남기지 않고
+    0.5초 이상 지속된 것만 마커로 남김, extract_event_log 참고)"""
+    baseline_ear = calibration.ear_baseline if calibration is not None else compute_baseline(series.timestamps, series.ear)
+    threshold = baseline_ear * BLINK_EAR_RATIO_THRESHOLD
+
+    episodes = detect_episodes(series.timestamps, series.ear, lambda v: v <= threshold, BLINK_EPISODE_CONFIG)
+    count = len(episodes)
+    long_episodes = [e for e in episodes if e.duration_sec >= LONG_BLINK_THRESHOLD_SEC]
+
+    total_duration_min = (series.timestamps[-1] - series.timestamps[0]) / 60.0
+    per_min = round(count / total_duration_min, 1) if total_duration_min > 0 else 0.0
+
+    return {
+        "blink_count_total": count,
+        "blink_per_min": per_min,
+        "long_blink_count": len(long_episodes),
+        "blink_events": _episodes_to_events(long_episodes, EVENT_TYPE_LONG_BLINK),
+    }
+
+
+# --- 3-4. 미소·표정 강도 ---
+
+SMILE_SCORE_INCREASE_THRESHOLD = 0.15
+SMILE_EPISODE_CONFIG = EpisodeConfig(min_exceed_duration_sec=0.3, min_return_duration_sec=0.2)
+
+
+def analyze_smile(series: FaceMeshSeries, calibration: Optional[CalibrationProfile] = None) -> dict:
+    """[출력] smile_episode_count, smile_total_sec, smile_avg_intensity,
+    smile_events(SMILE 리스트, value=구간 평균 강도, extract_event_log 참고)"""
+    baseline = calibration.smile_baseline if calibration is not None else compute_baseline(series.timestamps, series.smile_score)
+    diff = [v - baseline for v in series.smile_score]
+
+    episodes = detect_episodes(series.timestamps, diff, lambda v: v >= SMILE_SCORE_INCREASE_THRESHOLD, SMILE_EPISODE_CONFIG)
+    count, total_sec = summarize_episodes(episodes)
+
+    smiling_values = [d for d in diff if d >= SMILE_SCORE_INCREASE_THRESHOLD]
+    avg_intensity = round(sum(smiling_values) / len(smiling_values), 3) if smiling_values else 0.0
+
+    def _intensity_value(e: Episode) -> str:
+        idx_range = [i for i, t in enumerate(series.timestamps) if e.start_sec <= t <= e.end_sec]
+        vals = [diff[i] for i in idx_range] or [0.0]
+        return str(round(sum(vals) / len(vals), 3))
+
+    return {
+        "smile_episode_count": count,
+        "smile_total_sec": round(total_sec, 2),
+        "smile_avg_intensity": avg_intensity,
+        "smile_events": _episodes_to_events(episodes, EVENT_TYPE_SMILE, value_fn=_intensity_value),
+    }
+
+
+# --- 3-5. 표정 변화량 ---
+
+EXPRESSION_VARIATION_SD_MULTIPLIER = 2.0
+EXPRESSION_EPISODE_CONFIG = EpisodeConfig(min_exceed_duration_sec=0.3, min_return_duration_sec=0.3)
+
+
+def analyze_expression_variation(series: FaceMeshSeries, calibration: Optional[CalibrationProfile] = None) -> dict:
+    """
+    [출력] expression_change_count, expression_variation_score
+    [입력] calibration: 넘기면 landmark_motion_baseline을 평균 기준으로 쓰고,
+        표준편차는 여전히 본 답변 영상 첫 3초 구간으로 근사함(캘리브레이션 클립은
+        "가만히 있기"를 요구하므로 표정 변화량의 자연스러운 변동폭을 대표하기 어려움 -
+        스켈레톤 단계 한계, 추후 파일럿 데이터로 재검토 필요).
+    """
+    baseline_window = [v for t, v in zip(series.timestamps, series.landmark_motion) if t <= 3.0]
+    baseline_mean = calibration.landmark_motion_baseline if calibration is not None else (
+        sum(baseline_window) / len(baseline_window) if baseline_window else 0.0
+    )
+    baseline_sd = std_dev(baseline_window)
+    threshold = baseline_mean + EXPRESSION_VARIATION_SD_MULTIPLIER * baseline_sd
+
+    episodes = detect_episodes(
+        series.timestamps, series.landmark_motion, lambda v: v >= threshold, EXPRESSION_EPISODE_CONFIG
+    )
+    count, _ = summarize_episodes(episodes)
+
+    return {
+        "expression_change_count": count,
+        "expression_variation_score": round(sum(series.landmark_motion) / len(series.landmark_motion), 4),
+        # 표정변화는 "그 순간"이 마커 포인트라 순간 이벤트(end_time_sec=None)로 남김
+        "expression_events": _episodes_to_events(episodes, EVENT_TYPE_EXPRESSION_CHANGE, instant=True),
+    }
+
+
+# ====================================================================
+# 4. 고개 끄덕임 / 젓기 (얼굴방향 원본 시계열 재사용, 영상 재스캔 없음)
+# ====================================================================
+
+NOD_SHAKE_THRESHOLD_DEG = 8.0
+NOD_SHAKE_MIN_CYCLE_SEC = 0.2
+NOD_SHAKE_MAX_CYCLE_SEC = 1.5
+
+
+def _direction_cycle_episodes(timestamps: List[float], values: List[float], baseline: float) -> List[Episode]:
+    """
+    "정면 -> 기준각 이상 이동 -> 정면 복귀"를 0.2~1.5초 범위의 사이클로 셀 때 사용.
+    detect_episodes로 episode를 뽑은 뒤, 지속시간이 지정 범위 안에 드는 것만 반환.
+    """
+    dev = [v - baseline for v in values]
+    config = EpisodeConfig(min_exceed_duration_sec=0.05, min_return_duration_sec=0.1)
+    episodes = detect_episodes(timestamps, dev, lambda v: abs(v) >= NOD_SHAKE_THRESHOLD_DEG, config)
+    return [e for e in episodes if NOD_SHAKE_MIN_CYCLE_SEC <= e.duration_sec <= NOD_SHAKE_MAX_CYCLE_SEC]
+
+
+def analyze_nod_shake(series: FaceMeshSeries, calibration: Optional[CalibrationProfile] = None) -> dict:
+    """[출력] nod_count(고개 끄덕임=pitch 기준), shake_count(고개 젓기=yaw 기준),
+    nod_shake_events(NOD/SHAKE 리스트, 순간 이벤트, extract_event_log 참고)"""
+    if calibration is not None:
+        pitch_baseline = calibration.pitch_baseline
+        yaw_baseline = calibration.yaw_baseline
+    else:
+        pitch_baseline = compute_baseline(series.timestamps, series.pitch)
+        yaw_baseline = compute_baseline(series.timestamps, series.yaw)
+
+    nod_episodes = _direction_cycle_episodes(series.timestamps, series.pitch, pitch_baseline)
+    shake_episodes = _direction_cycle_episodes(series.timestamps, series.yaw, yaw_baseline)
+
+    events = (
+        _episodes_to_events(nod_episodes, EVENT_TYPE_NOD, instant=True)
+        + _episodes_to_events(shake_episodes, EVENT_TYPE_SHAKE, instant=True)
+    )
+    events.sort(key=lambda ev: ev.start_time_sec)
+
+    return {
+        "nod_count": len(nod_episodes),
+        "shake_count": len(shake_episodes),
+        "nod_shake_events": events,
+    }
+
+
+# ====================================================================
+# 5. 자세계열 (MediaPipe Pose + Hands, 영상 1회 스캔)
+# ====================================================================
+
+@dataclass
+class PoseRawSeries:
+    """
+    영상 1회 스캔으로 얻은 상체/손 관련 "원본" 시계열 (baseline 보정 이전 단계).
+    캘리브레이션 클립에도, 본 답변 클립에도 동일하게 사용 (I/O와 baseline 계산을 분리하기 위함).
+    """
+    timestamps: List[float]
+    fps: float
+    shoulder_center: List[Tuple[float, float]]   # 픽셀 좌표
+    shoulder_width: List[float]                  # 픽셀 단위 어깨너비 (정규화 척도로 사용)
+    shoulder_angle_deg: List[float]               # 어깨선이 수평에서 기울어진 각도 (원본, 도 단위)
+    hand_center: List[Optional[Tuple[float, float]]]  # 픽셀 좌표. 손 미검출 프레임은 None
+
+
+@dataclass
+class PoseSeries:
+    """baseline 보정을 거친 뒤의 시계열. analyze_body_movement/analyze_hand_gesture가 사용."""
+    timestamps: List[float]
+    shoulder_center_shift: List[float]  # baseline 대비 어깨중심 이동량 (어깨너비로 정규화)
+    shoulder_angle_deg: List[float]     # baseline 각도 대비 편차 (도)
+    hand_center_shift: List[float]      # baseline 대비 손 중심 이동량 (어깨너비로 정규화). 손 미검출 프레임은 0.0
+
+
+def extract_pose_raw_series(video_path: str) -> PoseRawSeries:
+    """
+    영상을 1회 스캔하며 상체(어깨)와 손의 원본 위치를 추출한다. baseline 계산은 하지 않음
+    (캘리브레이션 클립/본 답변 클립 어디에나 그대로 재사용하기 위해 I/O와 분리해둠).
+
+    [입력] video_path
+    [출력] PoseRawSeries
+    [주의] mediapipe, opencv-python 필요. 손이 화면 밖으로 나가면 그 프레임은 None으로 처리됨
+           (문서 주의사항: "손이 화면 밖에 있으면 측정 누락 가능").
+    """
+    import cv2
+    import mediapipe as mp
+    import numpy as np
+
+    mp_pose = mp.solutions.pose
+    mp_hands = mp.solutions.hands
+
+    timestamps: List[float] = []
+    shoulder_positions: List[Tuple[float, float]] = []
+    shoulder_widths: List[float] = []
+    shoulder_angles: List[float] = []
+    hand_positions: List[Optional[Tuple[float, float]]] = []
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+    with mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose, \
+         mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5) as hands:
+
+        frame_idx = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            t = frame_idx / fps
+            h, w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            pose_result = pose.process(rgb)
+            if not pose_result.pose_landmarks:
+                frame_idx += 1
+                continue
+
+            lm = pose_result.pose_landmarks.landmark
+            left_sh = np.array([lm[11].x * w, lm[11].y * h])
+            right_sh = np.array([lm[12].x * w, lm[12].y * h])
+            shoulder_center = (left_sh + right_sh) / 2.0
+            shoulder_width = float(np.linalg.norm(left_sh - right_sh))
+            if shoulder_width < 1e-6:
+                frame_idx += 1
+                continue
+
+            # 어깨선이 수평에서 얼마나 기울어졌는지 (도 단위)
+            dx = right_sh[0] - left_sh[0]
+            dy = right_sh[1] - left_sh[1]
+            shoulder_angle = float(np.degrees(np.arctan2(dy, dx)))
+
+            hands_result = hands.process(rgb)
+            hand_center = None
+            if hands_result.multi_hand_landmarks:
+                centers = []
+                for hand_lm in hands_result.multi_hand_landmarks:
+                    xs = [p.x * w for p in hand_lm.landmark]
+                    ys = [p.y * h for p in hand_lm.landmark]
+                    centers.append((sum(xs) / len(xs), sum(ys) / len(ys)))
+                cx = sum(c[0] for c in centers) / len(centers)
+                cy = sum(c[1] for c in centers) / len(centers)
+                hand_center = (cx, cy)
+
+            timestamps.append(t)
+            shoulder_positions.append((float(shoulder_center[0]), float(shoulder_center[1])))
+            shoulder_widths.append(shoulder_width)
+            shoulder_angles.append(shoulder_angle)
+            hand_positions.append(hand_center)
+
+            frame_idx += 1
+
+    cap.release()
+    if not timestamps:
+        raise ValueError("상체(어깨)를 감지하지 못했습니다. 영상을 확인하세요.")
+
+    return PoseRawSeries(
+        timestamps=timestamps,
+        fps=fps,
+        shoulder_center=shoulder_positions,
+        shoulder_width=shoulder_widths,
+        shoulder_angle_deg=shoulder_angles,
+        hand_center=hand_positions,
+    )
+
+
+def _angle_diff(a: float, b: float) -> float:
+    """각도 차이를 -180~180 범위로 정규화해서 계산 (경계 넘나들기 버그 방지)."""
+    d = (a - b + 180) % 360 - 180
+    return abs(d)
+
+
+def compute_pose_deviations(raw: PoseRawSeries, calibration: Optional[CalibrationProfile] = None) -> PoseSeries:
+    """
+    PoseRawSeries(원본 위치/각도)를 baseline 대비 편차로 변환한다.
+
+    [입력]
+        raw: extract_pose_raw_series()의 결과 (본 답변 클립에서 추출한 것)
+        calibration: 넘기면 캘리브레이션 클립의 shoulder_width_baseline/shoulder_angle_baseline을
+            정규화·각도 기준으로 사용. 생략하면 v0.2 방식(본 영상 자체 첫 3초)으로 폴백함
+            (하위 호환용, 실서비스 비권장 - 자세 기준점도 "카메라 앞 정자세" 캘리브레이션
+            순간에서 뽑아야 정확함).
+    [출력] PoseSeries (analyze_body_movement/analyze_hand_gesture 입력으로 사용)
+    """
+    timestamps = raw.timestamps
+    fps = raw.fps
+
+    if calibration is not None:
+        avg_shoulder_width = calibration.shoulder_width_baseline
+        baseline_angle = calibration.shoulder_angle_baseline
+        # 캘리브레이션 클립에서 손 baseline까지 넉넉히 만들진 않음(손은 보통 무릎/책상 위 대기 상태라
+        # "제스처 여부" 판정에는 절대 위치보다 상대 이동이 더 중요) - 첫 검출 위치를 기준점으로 사용.
+        baseline_hand = next((hp for hp in raw.hand_center if hp is not None), None)
+    else:
+        baseline_idx = [i for i, t in enumerate(timestamps) if t <= 3.0] or [0]
+        avg_shoulder_width = sum(raw.shoulder_width[i] for i in baseline_idx) / len(baseline_idx)
+        baseline_angle = circular_mean_degrees([raw.shoulder_angle_deg[i] for i in baseline_idx])
+        baseline_hand = next((hp for hp in raw.hand_center[:len(baseline_idx)] if hp is not None), None)
+
+    # 상체 움직임(흔들림)은 "시작 위치 대비 누적 이동"이 아니라
+    # "약 0.5초 전 위치 대비 순간 이동량"으로 측정한다.
+    # (실측 결과: 자세를 한 번 고쳐 앉고 유지하면, 시작점 기준 거리 비교 방식은
+    #  그 뒤로 영상이 끝날 때까지 계속 "이탈 중"으로 잘못 판정되는 문제가 발견되어 v0.2에서 수정)
+    window_frames = max(1, round(0.5 * fps))
+    shoulder_shift = []
+    for i in range(len(raw.shoulder_center)):
+        ref_i = max(0, i - window_frames)
+        cur = raw.shoulder_center[i]
+        ref = raw.shoulder_center[ref_i]
+        dist = ((cur[0] - ref[0]) ** 2 + (cur[1] - ref[1]) ** 2) ** 0.5
+        shoulder_shift.append(dist / avg_shoulder_width)
