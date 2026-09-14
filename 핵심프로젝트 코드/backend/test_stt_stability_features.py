@@ -34,3 +34,11 @@ def test_stt_stability_features_basic():
     # 문장부호/영문/숫자가 아니라 한글 음절만 속도 계산에 사용한다.
     assert result["hangul_syllable_count"] > 0
     assert result["word_timestamps_available"] is True
+
+    return result
+
+
+if __name__ == "__main__":
+    result = test_stt_stability_features_basic()
+    print("[PASS] STT stability feature test")
+    print(result)
