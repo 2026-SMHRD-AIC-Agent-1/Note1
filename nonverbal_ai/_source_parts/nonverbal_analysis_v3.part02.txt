@@ -1,0 +1,301 @@
+        shoulder_width_baseline=median(pose_series.shoulder_width),
+        shoulder_angle_baseline=circular_mean_degrees(pose_series.shoulder_angle_deg),
+        is_valid=is_valid,
+        validation_message=validation_message,
+        detection_rate=detection_rate,
+    )
+
+
+# ====================================================================
+# 3. 얼굴계열 원본 시계열 추출 (MediaPipe Face Mesh, 영상 1회 스캔)
+# ====================================================================
+
+# MediaPipe Face Mesh landmark index
+_POSE_LANDMARK_IDS = [1, 152, 33, 263, 61, 291]      # 코끝/턱/눈양끝/입양끝 (yaw/pitch/roll 계산용)
+_LEFT_EYE_CORNER_IDS = (33, 133)
+_RIGHT_EYE_CORNER_IDS = (362, 263)
+_LEFT_IRIS_CENTER_ID = 468
+_RIGHT_IRIS_CENTER_ID = 473
+_LEFT_EYE_EAR_IDS = (159, 145, 33, 133)   # (위, 아래, 바깥, 안쪽) - EAR 근사 계산용
+_RIGHT_EYE_EAR_IDS = (386, 374, 362, 263)
+_MOUTH_CORNER_IDS = (61, 291)              # 입꼬리 (좌우)
+_MOUTH_TOP_BOTTOM_IDS = (13, 14)           # 윗입술/아랫입술 중앙
+
+
+@dataclass
+class FaceMeshSeries:
+    """영상 1회 스캔으로 얻은 얼굴 관련 원본 시계열 모음."""
+    timestamps: List[float]
+    yaw: List[float]
+    pitch: List[float]
+    roll: List[float]
+    gaze_ratio: List[float]       # 0(왼쪽)~1(오른쪽), 눈 안에서 홍채 위치
+    ear: List[float]              # Eye Aspect Ratio (클수록 눈 뜸)
+    smile_score: List[float]      # 입 벌어짐 대비 입꼬리 폭 비율 (클수록 미소)
+    landmark_motion: List[float]  # 이전 프레임 대비 얼굴 랜드마크 변화량 (표정 변화량 계산용)
+    gaze_is_approx: bool = False
+    # True면 gaze_ratio가 실제 홍채 위치가 아니라 head yaw 기반 근사치임을 뜻함.
+    # [배경] 특정 영상에서 mediapipe 홍채(iris) 서브모델이 원인 불명으로 전혀 감지를
+    # 못 하는 현상이 실측으로 확인됨(해상도/코덱/mediapipe 버전 문제 다 배제하고 검증함 -
+    # 얼굴 개인별 특성에 따른 모델 한계로 추정). 이 경우 시선을 아예 못 재는 대신,
+    # "고개가 돌아간 정도"로 시선을 근사함(사람은 카메라에서 눈에 띄게 벗어난 곳을 볼 때
+    # 대개 고개도 같이 돌아가므로). 단 이 근사치는 "눈만 움직이고 고개는 고정"인 미세한
+    # 시선 이탈은 못 잡는다는 한계가 있음 - analyze_gaze_direction의 gaze_events에
+    # event_type은 그대로 GAZE_AWAY를 쓰되, 호출부가 gaze_is_approx로 신뢰도를 구분할 것.
+
+
+def extract_face_mesh_series(video_path: str) -> FaceMeshSeries:
+    """
+    영상을 한 번만 읽으면서 얼굴 관련 5개 항목에 필요한 원본 값을 모두 추출한다.
+
+    [입력] video_path: 영상 파일 경로
+    [출력] FaceMeshSeries (얼굴방향/시선/눈깜빡임/미소/표정변화량 원본 시계열)
+
+    [주의] mediapipe, opencv-python 설치 필요. 실제 영상 파일 있어야 실행 가능.
+           모든 각도/비율은 근사치이며 파일럿 데이터로 검증 필요.
+
+    [견고성 - v0.3.6] refine_landmarks=True(홍채 랜드마크, 시선 계산에 필요)로 스캔했을 때
+    영상 전체에서 단 한 프레임도 감지 안 되는 경우가 실제로 발견됨(원인 불명 - 압축/해상도
+    조합에 따라 홍채 서브모델만 실패하는 것으로 보이며, 얼굴 랜드마크 자체는 정상 감지됨).
+    이 경우 전체를 실패시키지 않고, refine_landmarks=False로 한 번 더 스캔해서 얼굴방향/
+    눈깜빡임/미소/표정변화는 살리고, 시선(gaze_ratio)만 전부 0.5(중립값)으로 채워 반환함.
+    이때는 gaze_deviation_count 등 시선 관련 지표를 신뢰할 수 없음 - 반환된 series에는
+    이 사실이 별도 표시되지 않으니, 호출부에서 필요시 refine_landmarks 재시도 여부를
+    로그로 확인할 것(print로 안내됨).
+    """
+    import cv2
+    import mediapipe as mp
+    import numpy as np
+
+    mp_face_mesh = mp.solutions.face_mesh
+
+    face_3d_model = np.array([
+        [0.0, 0.0, 0.0], [0.0, -63.6, -12.5],
+        [-43.3, 32.7, -26.0], [43.3, 32.7, -26.0],
+        [-28.9, -28.9, -24.1], [28.9, -28.9, -24.1],
+    ], dtype=np.float64)
+
+    def _scan(refine_landmarks: bool, min_confidence: float = 0.5) -> FaceMeshSeries:
+        series = FaceMeshSeries([], [], [], [], [], [], [], [])
+        prev_landmarks_xy: Optional[np.ndarray] = None
+
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+        with mp_face_mesh.FaceMesh(
+            static_image_mode=False, max_num_faces=1, refine_landmarks=refine_landmarks,
+            min_detection_confidence=min_confidence, min_tracking_confidence=min_confidence,
+        ) as face_mesh:
+            frame_idx = 0
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                t = frame_idx / fps
+                h, w = frame.shape[:2]
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = face_mesh.process(rgb)
+
+                if results.multi_face_landmarks:
+                    lm = results.multi_face_landmarks[0].landmark
+
+                    # --- 얼굴 방향 (yaw/pitch/roll) ---
+                    face_2d = np.array([[lm[i].x * w, lm[i].y * h] for i in _POSE_LANDMARK_IDS], dtype=np.float64)
+                    focal_length = w
+                    cam_matrix = np.array([[focal_length, 0, w / 2], [0, focal_length, h / 2], [0, 0, 1]], dtype=np.float64)
+                    success, rotation_vec, _ = cv2.solvePnP(face_3d_model, face_2d, cam_matrix, np.zeros((4, 1)))
+
+                    if not success:
+                        frame_idx += 1
+                        continue
+
+                    rmat, _ = cv2.Rodrigues(rotation_vec)
+                    sy = (rmat[0, 0] ** 2 + rmat[1, 0] ** 2) ** 0.5
+                    pitch = float(np.degrees(np.arctan2(-rmat[2, 0], sy)))
+                    yaw = float(np.degrees(np.arctan2(rmat[1, 0], rmat[0, 0])))
+                    roll = float(np.degrees(np.arctan2(rmat[2, 1], rmat[2, 2])))
+                    # 이 3D 모델 좌표계 관례상 "정면"이 180도 근처로 계산되는 현상이 있어
+                    # 180도 근처 값을 0도 근처로 보정한다 (실측 결과로 발견/수정, v0.2)
+                    if roll > 90:
+                        roll -= 180
+                    elif roll < -90:
+                        roll += 180
+
+                    # --- 시선 (좌우 iris 비율) - refine_landmarks=False면 iris 랜드마크
+                    # 자체가 없으므로(0~467번만 존재) 계산을 건너뜀. 이 경우 gaze_ratio는
+                    # 그냥 자리채움 값(0.5)이고, 실제로는 analyze_gaze_direction이
+                    # series.gaze_is_approx=True일 때 이 필드 대신 series.yaw(고개방향)로
+                    # 시선을 근사함 - 여기서 처리하지 않는 이유는 baseline 보정이
+                    # analyze_gaze_direction 쪽 책임이라 원본 추출 단계에서는 raw yaw를
+                    # 그대로 두는 게 맞기 때문. ---
+                    has_iris_landmarks = refine_landmarks and len(lm) > max(_LEFT_IRIS_CENTER_ID, _RIGHT_IRIS_CENTER_ID)
+                    if has_iris_landmarks:
+                        def h_ratio(corner_ids, iris_id):
+                            outer_x, inner_x = lm[corner_ids[0]].x, lm[corner_ids[1]].x
+                            eye_width = inner_x - outer_x
+                            if abs(eye_width) < 1e-6:
+                                return None
+                            return (lm[iris_id].x - outer_x) / eye_width
+
+                        gaze_candidates = [r for r in (
+                            h_ratio(_LEFT_EYE_CORNER_IDS, _LEFT_IRIS_CENTER_ID),
+                            h_ratio(_RIGHT_EYE_CORNER_IDS, _RIGHT_IRIS_CENTER_ID),
+                        ) if r is not None]
+                        gaze_ratio = sum(gaze_candidates) / len(gaze_candidates) if gaze_candidates else 0.5
+                    else:
+                        gaze_ratio = 0.5
+
+                    # --- 눈 깜빡임 EAR (Eye Aspect Ratio 근사: 세로/가로 비율) ---
+                    def ear(eye_ids):
+                        top, bottom, outer, inner = eye_ids
+                        vertical = abs(lm[top].y - lm[bottom].y)
+                        horizontal = abs(lm[inner].x - lm[outer].x)
+                        if horizontal < 1e-6:
+                            return 0.0
+                        return vertical / horizontal
+
+                    ear_value = (ear(_LEFT_EYE_EAR_IDS) + ear(_RIGHT_EYE_EAR_IDS)) / 2.0
+
+                    # --- 미소 강도 (입꼬리 폭 / 얼굴 폭) ---
+                    face_width = abs(lm[_POSE_LANDMARK_IDS[2]].x - lm[_POSE_LANDMARK_IDS[3]].x) * w
+                    mouth_width = abs(lm[_MOUTH_CORNER_IDS[0]].x - lm[_MOUTH_CORNER_IDS[1]].x) * w
+                    smile_score = mouth_width / face_width if face_width > 1e-6 else 0.0
+
+                    # --- 표정 변화량 (이전 프레임 대비 주요 랜드마크 이동량, 얼굴폭으로 정규화) ---
+                    key_ids = _POSE_LANDMARK_IDS + list(_MOUTH_CORNER_IDS) + list(_MOUTH_TOP_BOTTOM_IDS)
+                    cur_xy = np.array([[lm[i].x * w, lm[i].y * h] for i in key_ids], dtype=np.float64)
+                    if prev_landmarks_xy is not None and face_width > 1e-6:
+                        motion = float(np.mean(np.linalg.norm(cur_xy - prev_landmarks_xy, axis=1))) / face_width
+                    else:
+                        motion = 0.0
+                    prev_landmarks_xy = cur_xy
+
+                    series.timestamps.append(t)
+                    series.yaw.append(yaw)
+                    series.pitch.append(pitch)
+                    series.roll.append(roll)
+                    series.gaze_ratio.append(gaze_ratio)
+                    series.ear.append(ear_value)
+                    series.smile_score.append(smile_score)
+                    series.landmark_motion.append(motion)
+
+                frame_idx += 1
+
+        cap.release()
+        return series
+
+    series = _scan(refine_landmarks=True, min_confidence=0.5)
+    if not series.timestamps:
+        print(f"[경고] {video_path}: refine_landmarks=True로 얼굴이 전혀 감지되지 않아 "
+              f"refine_landmarks=False로 재시도합니다 (시선은 홍채 대신 고개방향(yaw) 근사로 대체됨).")
+        series = _scan(refine_landmarks=False, min_confidence=0.5)
+        if series.timestamps:
+            series.gaze_is_approx = True
+    if not series.timestamps:
+        print(f"[경고] {video_path}: min_confidence=0.5로도 감지 안 돼 0.3으로 낮춰 재시도합니다 "
+              f"(오탐지 가능성이 커지므로 결과 신뢰도가 낮을 수 있음).")
+        series = _scan(refine_landmarks=False, min_confidence=0.3)
+        if series.timestamps:
+            series.gaze_is_approx = True
+    if not series.timestamps:
+        raise ValueError("얼굴을 감지하지 못했습니다. 영상을 확인하세요.")
+    return series
+
+
+# --- 3-1. 얼굴 방향 ---
+
+FACE_YAW_THRESHOLD_DEG = 15.0
+FACE_PITCH_THRESHOLD_DEG = 12.0
+FACE_EPISODE_CONFIG = EpisodeConfig(min_exceed_duration_sec=0.5, min_return_duration_sec=0.3)
+
+
+def analyze_face_direction(series: FaceMeshSeries, calibration: Optional[CalibrationProfile] = None) -> dict:
+    """
+    [출력] face_yaw, face_pitch, face_roll, face_deviation_count, face_deviation_total_sec,
+        face_direction_events(FACE_TURNED 리스트, extract_event_log 참고)
+    [입력] calibration: 세션 시작 전 캘리브레이션 결과. 넘기면 그 baseline을 사용하고,
+        생략하면 v0.2 방식(본 영상 자체 첫 3초)으로 폴백함(하위 호환용, 실서비스 비권장).
+    """
+    if calibration is not None:
+        yaw_baseline = calibration.yaw_baseline
+        pitch_baseline = calibration.pitch_baseline
+    else:
+        yaw_baseline = compute_baseline(series.timestamps, series.yaw)
+        pitch_baseline = compute_baseline(series.timestamps, series.pitch)
+    yaw_c = [v - yaw_baseline for v in series.yaw]
+    pitch_c = [v - pitch_baseline for v in series.pitch]
+
+    flags = [1.0 if (abs(yaw_c[i]) >= FACE_YAW_THRESHOLD_DEG or abs(pitch_c[i]) >= FACE_PITCH_THRESHOLD_DEG) else 0.0
+             for i in range(len(series.timestamps))]
+    episodes = detect_episodes(series.timestamps, flags, lambda v: v >= 0.5, FACE_EPISODE_CONFIG)
+    count, total_sec = summarize_episodes(episodes)
+
+    def _direction_value(e: Episode) -> str:
+        # yaw/pitch 중 더 크게(threshold 대비) 벗어난 축을 우선해서 방향을 정함.
+        # [주의] 부호(+/-)와 실제 좌/우·상/하 방향의 매칭은 mediapipe 랜드마크 좌표계
+        # 기준 추정치임 - 실제 영상으로 검증 후 필요하면 부호 뒤집을 것 (스켈레톤 단계 한계)
+        yaw_v = _value_at(series.timestamps, yaw_c, e.start_sec)
+        pitch_v = _value_at(series.timestamps, pitch_c, e.start_sec)
+        if abs(yaw_v) >= FACE_YAW_THRESHOLD_DEG:
+            return "right" if yaw_v >= 0 else "left"
+        return "down" if pitch_v >= 0 else "up"
+
+    return {
+        "face_yaw": round(sum(series.yaw) / len(series.yaw), 2),
+        "face_pitch": round(sum(series.pitch) / len(series.pitch), 2),
+        "face_roll": round(sum(series.roll) / len(series.roll), 2),
+        "face_deviation_count": count,
+        "face_deviation_total_sec": round(total_sec, 2),
+        "face_direction_events": _episodes_to_events(episodes, EVENT_TYPE_FACE_TURNED, value_fn=_direction_value),
+    }
+
+
+# --- 3-2. 시선 방향 ---
+
+GAZE_DEVIATION_RATIO_THRESHOLD = 0.03  # v0.3.4: 실제 면접 영상(IMG_9634)으로 검증한 값.
+    # 기존 0.18은 실측 gaze_ratio 변동폭(표준편차 0.02, 전체 범위 0.14)보다 훨씬 커서
+    # 이탈이 전혀 안 잡히는 문제가 있었음 - 측정기준정의서에도 "임계값은 파일럿 데이터로
+    # 검증 필요"라고 명시돼 있던 부분이 실제로 확인된 것. realtime_gaze_prototype.py와
+    # 동일 값으로 맞춤 (같은 계산식을 쓰므로 임계값도 같아야 함).
+GAZE_EPISODE_CONFIG = EpisodeConfig(min_exceed_duration_sec=0.15, min_return_duration_sec=0.15)
+    # 기존 0.4/0.3 -> 0.15/0.15. 실측 결과 실제 이탈 지속시간이 대부분 0.2~0.5초라
+    # 0.4초 기준으로는 대부분 걸러져버림.
+
+# EAR(눈 종횡비)이 이 값보다 낮으면(눈 감음/아래 봄) 그 프레임은 좌우 시선 판정에서 제외.
+# [발견 경위] 실제 면접 영상으로 검증하던 중, 눈 감은 순간·아래를 보는 순간에 홍채
+# 랜드마크가 눈꺼풀에 가려지면서 gaze_ratio가 "왼쪽으로 이탈"로 오탐지되는 걸 프레임
+# 이미지로 직접 확인함. realtime_gaze_prototype.py와 동일 값/로직으로 맞춤.
+MIN_EAR_FOR_GAZE_CHECK = 0.15
+
+# gaze_is_approx=True(홍채 모델 실패, 고개방향으로 근사)일 때 쓰는 임계값(도 단위).
+# [v0.3.7 신규 - 미검증] 실제 iris 기반 GAZE_DEVIATION_RATIO_THRESHOLD(0.03)처럼 실측
+# 검증을 거치지 못한 잠정치임. 고개를 돌려 눈에 띄게 다른 곳을 볼 때 대략 이 정도
+# 각도(8도) 이상은 움직인다고 가정한 값 - 파일럿 데이터로 재검증 필요.
+GAZE_APPROX_YAW_THRESHOLD_DEG = 8.0
+
+
+def analyze_gaze_direction(series: FaceMeshSeries, calibration: Optional[CalibrationProfile] = None) -> dict:
+    """
+    [출력] gaze_center_ratio, gaze_left_ratio, gaze_right_ratio, gaze_deviation_count,
+        gaze_deviation_total_sec, gaze_events(GAZE_AWAY 리스트, extract_event_log 참고),
+        gaze_data_source("iris" 또는 "head_pose_approx")
+    [입력] calibration: 넘기면 캘리브레이션 클립에서 뽑은 gaze_baseline(또는 근사 모드일 땐
+        yaw_baseline) 사용. 웹캠이 화면 위쪽에 있어 정면 응시 시에도 시선이 위로 치우치는
+        구조적 편향은 이 baseline(카메라를 실제로 본 순간의 값)으로만 정확히 상쇄됨 -
+        반드시 넘길 것을 권장.
+    [주의] EAR(series.ear)이 MIN_EAR_FOR_GAZE_CHECK 미만인 프레임(눈 감음/아래 봄)은
+        좌우 판정에서 제외함 - 그 프레임의 dev를 0(=정상)으로 취급. 눈꺼풀이 홍채를
+        가리면 gaze_ratio 계산 자체가 왜곡돼서, 필터링 없이는 "왼쪽 이탈"로 오탐지될 수 있음.
+
+    [gaze_is_approx - v0.3.7 신규] mediapipe 홍채 서브모델이 원인 불명으로 영상 전체에서
+    전혀 감지 안 되는 경우가 실측으로 확인됨(해상도/코덱/버전 문제 다 배제하고 검증 -
+    사람별 얼굴 특성에 따른 모델 한계로 추정). 이때는 series.gaze_is_approx=True로 표시되고,
+    실제 홍채 대신 "고개가 얼마나 돌아갔는지"(yaw)로 시선을 근사함. 사람은 눈에 띄게
+    다른 곳을 볼 때 대개 고개도 같이 돌아간다는 전제인데, "눈만 움직이고 고개는 고정"인
+    미세한 시선 이탈은 이 방식으로는 못 잡는다는 명확한 한계가 있음 - gaze_data_source로
+    호출부가 신뢰도를 구분할 것.
+    """
+    if series.gaze_is_approx:
+        source_values = series.yaw
+        baseline = calibration.yaw_baseline if calibration is not None else compute_baseline(series.timestamps, source_values)
+        threshold = GAZE_APPROX_YAW_THRESHOLD_DEG
