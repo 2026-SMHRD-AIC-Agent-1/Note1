@@ -1,4 +1,4 @@
-"""45개 파일럿 영상용 상세 STT 배치 실행기.
+"""45개 파일럿 영상용 상세 STT + 전달안정성 feature 배치 실행기.
 
 예시:
   python scripts/run_stt_batch.py --input-root "C:/pilot/videos" --output-dir "C:/pilot/stt_results" --limit 3
@@ -26,6 +26,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from stt_service import init_stt_service, is_ready, transcribe_audio_detailed  # noqa: E402
+from stt_stability_features import analyze_stt_stability  # noqa: E402
 
 VIDEO_RE = re.compile(r"video_(\d+)\.(?:mp4|webm|m4a|mp3|wav|mpeg|mpga)$", re.IGNORECASE)
 
@@ -91,16 +92,20 @@ def main():
         print(f"[STT] {person} video_{video_num} ...")
         try:
             detail = transcribe_audio_detailed(str(path))
+            stability = analyze_stt_stability(detail)
             payload = {
                 "person": person,
                 "video_num": video_num,
                 "source_file": path.name,
                 **detail,
+                "stability_features": stability,
             }
             out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             print(
                 f"[OK] {out_path} | words={len(detail.get('words', []))} "
-                f"| text={detail.get('text', '')[:60]}"
+                f"| spm={stability.get('gross_syllables_per_min')} "
+                f"| filler={stability.get('strong_filler_count')} "
+                f"| text={detail.get('text', '')[:50]}"
             )
             completed += 1
         except Exception as exc:  # noqa: BLE001
