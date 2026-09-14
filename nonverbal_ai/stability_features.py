@@ -36,7 +36,8 @@ def derive_stability_features(raw, duration_sec=None):
     """Convert one raw analyzer result into calibration-ready stability features.
 
     Rules from the 45-video review:
-    - Iris gaze may become a score input; head-pose gaze is reference-only.
+    - Only calibrated iris gaze may become a future score input.
+      Uncalibrated iris and head-pose gaze remain reference-only.
     - Head/posture uses deviation frequency/time, not absolute yaw/pitch/roll.
     - Pauses are evidence, not an automatic penalty; STT context is required.
     - Voice stability uses within-answer dB variation, not average loudness.
@@ -49,10 +50,14 @@ def derive_stability_features(raw, duration_sec=None):
     audio_valid = bool(audio_quality.get("is_valid", True))
     audio_issues = [x.get("code") for x in audio_quality.get("issues", []) if isinstance(x, dict)]
 
+    calibration_used = bool(raw.get("calibration_used", False))
     gaze_source = raw.get("gaze_data_source")
-    if gaze_source == "iris":
-        gaze_status = "measured_iris"
+    if gaze_source == "iris" and calibration_used:
+        gaze_status = "measured_iris_calibrated"
         gaze_score_candidate = True
+    elif gaze_source == "iris":
+        gaze_status = "measured_iris_uncalibrated"
+        gaze_score_candidate = False
     elif gaze_source == "head_pose_approx":
         gaze_status = "approx_head_pose"
         gaze_score_candidate = False
@@ -60,13 +65,14 @@ def derive_stability_features(raw, duration_sec=None):
         gaze_status = "source_unknown"
         gaze_score_candidate = False
 
+    iris_reference = gaze_source == "iris"
     flow_available = audio_valid and raw.get("pause_count") is not None
     voice_available = audio_valid and raw.get("db_std") is not None
 
     return {
         "measurement": {
             "duration_sec": duration_sec,
-            "calibration_used": bool(raw.get("calibration_used", False)),
+            "calibration_used": calibration_used,
             "audio_status": "available" if audio_valid else "measurement_unavailable",
             "audio_issue_codes": audio_issues,
             "gaze_status": gaze_status,
@@ -74,17 +80,25 @@ def derive_stability_features(raw, duration_sec=None):
             "gaze_valid_frame_ratio": raw.get("gaze_valid_frame_ratio"),
         },
         "gaze_stability": {
+            # Candidate fields stay empty until an iris baseline was actually calibrated.
             "center_ratio": raw.get("gaze_center_ratio") if gaze_score_candidate else None,
             "deviation_per_min": _rate_per_min(raw.get("gaze_deviation_count"), duration_sec) if gaze_score_candidate else None,
             "deviation_time_ratio": _time_ratio(raw.get("gaze_deviation_total_sec"), duration_sec) if gaze_score_candidate else None,
+            # Keep uncalibrated iris/head-pose values for pilot review without treating them as scores.
+            "iris_center_ratio_reference": raw.get("gaze_center_ratio") if iris_reference else None,
+            "iris_deviation_per_min_reference": _rate_per_min(raw.get("gaze_deviation_count"), duration_sec) if iris_reference else None,
+            "iris_deviation_time_ratio_reference": _time_ratio(raw.get("gaze_deviation_total_sec"), duration_sec) if iris_reference else None,
             "approx_deviation_per_min": _rate_per_min(raw.get("gaze_deviation_count"), duration_sec) if gaze_source == "head_pose_approx" else None,
             "approx_deviation_time_ratio": _time_ratio(raw.get("gaze_deviation_total_sec"), duration_sec) if gaze_source == "head_pose_approx" else None,
+            "scoring_note": "Only calibrated iris gaze is score-eligible; other gaze values are reference-only.",
         },
         "head_posture_stability": {
+            "status": "calibrated_candidate" if calibration_used else "reference_only_uncalibrated",
             "face_deviation_per_min": _rate_per_min(raw.get("face_deviation_count"), duration_sec),
             "face_deviation_time_ratio": _time_ratio(raw.get("face_deviation_total_sec"), duration_sec),
             "body_movement_per_min_reference": _rate_per_min(raw.get("body_movement_count"), duration_sec),
             "body_movement_time_ratio_reference": _time_ratio(raw.get("body_movement_total_sec"), duration_sec),
+            "scoring_note": "45-video pilot was uncalibrated and posture/body events were sparse; do not score these values yet.",
         },
         "speaking_flow": {
             "status": "available" if flow_available else "measurement_unavailable",
