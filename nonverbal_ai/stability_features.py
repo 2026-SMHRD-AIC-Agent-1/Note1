@@ -2,7 +2,7 @@
 
 This module does not assign a final score or psychological label. It converts raw
 nonverbal output into normalized measurements plus measurement-status flags so
-thresholds can be calibrated separately from the 45-video pilot set.
+thresholds and weights can be versioned separately.
 """
 from __future__ import annotations
 
@@ -35,10 +35,13 @@ def infer_duration_sec(raw):
 def derive_stability_features(raw, duration_sec=None):
     """Convert one raw analyzer result into calibration-ready stability features.
 
-    Rules from the 45-video review:
-    - Only calibrated iris gaze may become a future score input.
-      Uncalibrated iris and head-pose gaze remain reference-only.
-    - Head/posture uses deviation frequency/time, not absolute yaw/pitch/roll.
+    A!SK V1 rules confirmed 2026-09-14:
+    - Calibrated iris gaze is score-eligible. Uncalibrated iris/head-pose gaze is
+      reference-only.
+    - Calibrated posture is score-eligible and combines sustained head direction
+      and body/shoulder deviation evidence.
+    - Gaze/posture both use deviation frequency + deviation time ratio, not only
+      a single absolute angle.
     - Pauses are evidence, not an automatic penalty; STT context is required.
     - Voice stability uses within-answer dB variation, not average loudness.
     - Blink/smile/expression/nod/shake/gesture/pitch remain descriptive only.
@@ -65,9 +68,15 @@ def derive_stability_features(raw, duration_sec=None):
         gaze_status = "source_unknown"
         gaze_score_candidate = False
 
+    posture_score_candidate = calibration_used
     iris_reference = gaze_source == "iris"
     flow_available = audio_valid and raw.get("pause_count") is not None
     voice_available = audio_valid and raw.get("db_std") is not None
+
+    face_dev_per_min = _rate_per_min(raw.get("face_deviation_count"), duration_sec)
+    face_dev_time_ratio = _time_ratio(raw.get("face_deviation_total_sec"), duration_sec)
+    body_dev_per_min = _rate_per_min(raw.get("body_movement_count"), duration_sec)
+    body_dev_time_ratio = _time_ratio(raw.get("body_movement_total_sec"), duration_sec)
 
     return {
         "measurement": {
@@ -77,28 +86,36 @@ def derive_stability_features(raw, duration_sec=None):
             "audio_issue_codes": audio_issues,
             "gaze_status": gaze_status,
             "gaze_score_candidate": gaze_score_candidate,
+            "posture_score_candidate": posture_score_candidate,
             "gaze_valid_frame_ratio": raw.get("gaze_valid_frame_ratio"),
         },
         "gaze_stability": {
-            # Candidate fields stay empty until an iris baseline was actually calibrated.
             "center_ratio": raw.get("gaze_center_ratio") if gaze_score_candidate else None,
             "deviation_per_min": _rate_per_min(raw.get("gaze_deviation_count"), duration_sec) if gaze_score_candidate else None,
             "deviation_time_ratio": _time_ratio(raw.get("gaze_deviation_total_sec"), duration_sec) if gaze_score_candidate else None,
-            # Keep uncalibrated iris/head-pose values for pilot review without treating them as scores.
             "iris_center_ratio_reference": raw.get("gaze_center_ratio") if iris_reference else None,
             "iris_deviation_per_min_reference": _rate_per_min(raw.get("gaze_deviation_count"), duration_sec) if iris_reference else None,
             "iris_deviation_time_ratio_reference": _time_ratio(raw.get("gaze_deviation_total_sec"), duration_sec) if iris_reference else None,
             "approx_deviation_per_min": _rate_per_min(raw.get("gaze_deviation_count"), duration_sec) if gaze_source == "head_pose_approx" else None,
             "approx_deviation_time_ratio": _time_ratio(raw.get("gaze_deviation_total_sec"), duration_sec) if gaze_source == "head_pose_approx" else None,
-            "scoring_note": "Only calibrated iris gaze is score-eligible; other gaze values are reference-only.",
+            "scoring_note": "A!SK V1: calibrated iris only; meaningful gaze episodes require >=1.0 sec.",
         },
         "head_posture_stability": {
-            "status": "calibrated_candidate" if calibration_used else "reference_only_uncalibrated",
-            "face_deviation_per_min": _rate_per_min(raw.get("face_deviation_count"), duration_sec),
-            "face_deviation_time_ratio": _time_ratio(raw.get("face_deviation_total_sec"), duration_sec),
-            "body_movement_per_min_reference": _rate_per_min(raw.get("body_movement_count"), duration_sec),
-            "body_movement_time_ratio_reference": _time_ratio(raw.get("body_movement_total_sec"), duration_sec),
-            "scoring_note": "45-video pilot was uncalibrated and posture/body events were sparse; do not score these values yet.",
+            "status": "calibrated_candidate" if posture_score_candidate else "reference_only_uncalibrated",
+            "score_eligible": posture_score_candidate,
+            "face_deviation_per_min": face_dev_per_min if posture_score_candidate else None,
+            "face_deviation_time_ratio": face_dev_time_ratio if posture_score_candidate else None,
+            "body_movement_per_min": body_dev_per_min if posture_score_candidate else None,
+            "body_movement_time_ratio": body_dev_time_ratio if posture_score_candidate else None,
+            # Historical/reference fields are retained so old pilot notebooks do not break.
+            "face_deviation_per_min_reference": face_dev_per_min,
+            "face_deviation_time_ratio_reference": face_dev_time_ratio,
+            "body_movement_per_min_reference": body_dev_per_min,
+            "body_movement_time_ratio_reference": body_dev_time_ratio,
+            "scoring_note": (
+                "A!SK V1: score only after successful calibration. Posture combines sustained "
+                "head direction + shoulder/upper-body deviation; meaningful episodes require >=2.0 sec."
+            ),
         },
         "speaking_flow": {
             "status": "available" if flow_available else "measurement_unavailable",
