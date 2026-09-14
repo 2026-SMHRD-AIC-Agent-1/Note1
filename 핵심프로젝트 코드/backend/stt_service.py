@@ -20,8 +20,8 @@ MAX_AUDIO_MB = 50
 
 # 일반 서비스용 모델은 기존 환경변수를 존중합니다.
 DEFAULT_TEXT_MODEL = "gpt-4o-transcribe"
-# 단어 timestamp는 verbose_json이 필요하므로 상세 분석은 별도 모델을 사용합니다.
-DEFAULT_DETAIL_MODEL = "gpt-transcribe"
+# word/segment timestamp는 verbose_json이 필요합니다. 현재 상세 분석 기본값은 whisper-1입니다.
+DEFAULT_DETAIL_MODEL = "whisper-1"
 
 # 필러/반복/자기수정을 안정성 분석에 쓰기 위해 문장답게 정리하지 말고 발화 그대로 전사하도록 유도합니다.
 VERBATIM_TRANSCRIPTION_PROMPT = (
@@ -114,8 +114,8 @@ def transcribe_audio_detailed(audio_path: str, language: str = "ko") -> dict:
       word_timestamps_available
     }
 
-    `gpt-4o-transcribe` 계열은 verbose_json을 지원하지 않으므로 상세 분석 기본값은
-    `gpt-transcribe`입니다. 필요하면 OPENAI_TRANSCRIBE_DETAIL_MODEL로 변경할 수 있습니다.
+    word/segment timestamp를 받으려면 response_format=verbose_json이 필요합니다.
+    현재 상세 분석 기본 모델은 whisper-1이며, OPENAI_TRANSCRIBE_DETAIL_MODEL로 변경할 수 있습니다.
     """
     if _client is None:
         raise RuntimeError(_init_error or "STT 서비스가 아직 초기화되지 않았습니다.")
@@ -123,10 +123,10 @@ def transcribe_audio_detailed(audio_path: str, language: str = "ko") -> dict:
     path = Path(audio_path)
     validate_audio_file(path)
     model = os.getenv("OPENAI_TRANSCRIBE_DETAIL_MODEL", DEFAULT_DETAIL_MODEL)
-    if model in {"gpt-4o-transcribe", "gpt-4o-mini-transcribe", "gpt-4o-mini-transcribe-2025-12-15"}:
+    if model != "whisper-1":
         raise ValueError(
-            f"{model}은 상세 word timestamp용 verbose_json을 지원하지 않습니다. "
-            "OPENAI_TRANSCRIBE_DETAIL_MODEL을 gpt-transcribe 또는 timestamp 지원 모델로 설정하세요."
+            f"현재 상세 word/segment timestamp 경로는 whisper-1을 사용해야 합니다. "
+            f"현재 설정: {model}. OPENAI_TRANSCRIBE_DETAIL_MODEL=whisper-1 로 설정하세요."
         )
 
     with path.open("rb") as f:
