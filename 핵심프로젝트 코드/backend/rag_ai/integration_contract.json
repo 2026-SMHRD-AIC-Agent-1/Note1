@@ -1,0 +1,58 @@
+{
+  "question_generation_request": {
+    "company": "SK하이닉스",
+    "job": "System Architecture / Software Solution",
+    "interview_type": "AISK"
+  },
+  "question_generation_response_example": {
+    "question_type": "문제해결",
+    "question_text": "질문 텍스트",
+    "question_reason": "공개자료 기반 질문 이유",
+    "evaluation_points": ["평가포인트1", "평가포인트2", "평가포인트3"],
+    "rag_evidence": [
+      {
+        "source_title": "공식자료명",
+        "source_type": "official_job_posting",
+        "interview_type": "ALL",
+        "source_url": null,
+        "similarity": 0.82
+      }
+    ],
+    "practice_reason": null
+  },
+  "deep_followup_request": {
+    "question_data": {
+      "question_type": "문제해결",
+      "question_text": "첫 질문",
+      "evaluation_points": ["평가포인트1", "평가포인트2", "평가포인트3"]
+    },
+    "stt_text": "지원자의 첫 답변 STT 텍스트"
+  },
+  "deep_followup_response_example": {
+    "question_type": "문제해결",
+    "question_text": "꼬리질문 텍스트",
+    "question_reason": "첫 답변에서 추가 확인이 필요한 부분을 구체화하기 위한 심층 꼬리질문",
+    "evaluation_points": ["평가포인트1", "평가포인트2", "평가포인트3"],
+    "practice_reason": "첫 답변에서 구체화가 필요한 부분"
+  },
+  "answer_analysis_request": {
+    "question_data": "question_generation_response_example과 동일 구조",
+    "stt_text": "지원자 답변"
+  },
+  "answer_analysis_response_example": {
+    "job_evaluation": "일부 드러남",
+    "answer_evaluation": "잘 드러남",
+    "job_score": 67,
+    "answer_score": 88,
+    "strengths": "가장 중요한 강점 1문장",
+    "improvements": "가장 중요한 보완점 1문장"
+  },
+  "session_comparison": {
+    "comparison_basis": "SELF_PREVIOUS_SESSION",
+    "summary_scores": {
+      "job_score": {"previous": 67, "current": 83, "change": 16},
+      "answer_score": {"previous": 75, "current": 88, "change": 13},
+      "delivery_score": {"previous": null, "current": null, "change": null}
+    }
+  }
+}

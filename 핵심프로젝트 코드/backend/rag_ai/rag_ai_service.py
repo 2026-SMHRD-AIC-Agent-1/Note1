@@ -1,0 +1,919 @@
+import os
+import json
+import copy
+import hashlib
+import statistics
+from typing import Any, Dict, List, Literal, Optional
+
+import faiss
+import numpy as np
+from pydantic import BaseModel, Field
+from sentence_transformers import SentenceTransformer
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI
+from pypdf import PdfReader
+
+
+COMPANY_DEFAULT = 'SK하이닉스'
+JOB_DEFAULT = 'System Architecture / Software Solution'
+INTERVIEW_TYPES = ('AISK', 'DEEP_INTERVIEW')
+QUESTION_TYPES = ('직무이해', '문제해결', '협업')
+
+# 답변 평가 점수체계 v8:
+# 1) 직무평가 공통 세부조건은 5개를 유지한다.
+# 2) 답변 구성 기본평가는 최대 95점, 우수답변 조건은 최대 +5점으로 계산한다.
+# 3) 모든 답변이 기본평가와 우수답변 조건을 함께 평가받으며, LLM은 True/False만 판단한다.
+SCORING_VERSION = 'v8_answer_base95_excellence5'
+JOB_MAX_LEVEL = 5
+ANSWER_MAX_LEVEL = 4
+
+ANSWER_BASE_MAX_SCORE = 95
+ANSWER_EXCELLENCE_MAX_BONUS = 5
+
+# job_scope:
+# - ALL: 모든 직무에서 사용할 회사/면접 공통자료
+# - 특정 직무명: 해당 직무에서만 사용하는 자료
+# - MULTI: 한 파일에 여러 직무가 있어 현재 선택 직무 부분만 추출해서 사용
+SOURCE_RULES = {
+    '02_': {
+        'category': 'job',
+        'source_type': 'official_job_report',
+        'scope': 'job',
+        'interview_type': 'ALL',
+        'job_scope': JOB_DEFAULT,
+    },
+    '03_': {
+        'category': 'interview',
+        'source_type': 'interview_summary',
+        'scope': 'company',
+        'interview_type': 'ALL',
+        'job_scope': 'ALL',
+    },
+    '04_': {
+        'category': 'interview_process',
+        'source_type': 'official_process',
+        'scope': 'company',
+        'interview_type': 'AISK',
+        'job_scope': 'ALL',
+    },
+    '05_': {
+        'category': 'recruiting_direction',
+        'source_type': 'official_story',
+        'scope': 'company',
+        'interview_type': 'ALL',
+        'job_scope': 'ALL',
+    },
+    '06_': {
+        'category': 'job',
+        'source_type': 'official_job_posting',
+        'scope': 'job',
+        'interview_type': 'ALL',
+        'job_scope': 'Solution SW',
+    },
+    '07_': {
+        'category': 'company_values',
+        'source_type': 'official_home',
+        'scope': 'company',
+        'interview_type': 'ALL',
+        'job_scope': 'ALL',
+    },
+    '08_': {
+        'category': 'job_description',
+        'source_type': 'official_jd_extract',
+        'scope': 'job',
+        'interview_type': 'ALL',
+        'job_scope': 'MULTI',
+    },
+}
+
+ANSWER_STRUCTURE_CRITERIA = [
+    '질문에 직접 대응하는가',
+    '논리적으로 구성되어 있는가',
+    '구체적으로 설명하는가',
+    '명료하고 일관되게 전달하는가',
+]
+
+JOB_SUBCHECK_LABELS = [
+    '평가항목의 핵심 개념 또는 요구요소를 직접 다뤘는가',
+    '그 개념·행동의 의미·이유와 필요한 원인·영향·관계를 논리적으로 설명했는가',
+    '판단 기준·근거·지표·사례 중 하나 이상을 구체적으로 제시했는가',
+    '실제로 어떻게 접근·행동·적용할지 구체적인 방법이나 순서를 제시했는가',
+    '결과 확인·재측정·검증·성과·학습·후속 적용 중 하나 이상으로 마무리했는가',
+]
+
+ANSWER_EXCELLENCE_LABELS = [
+    '답변 초반에 핵심 결론·입장·접근 방향이 분명하게 제시되고 끝까지 유지되는가',
+    '결론·이유·근거/예시·방법/행동 중 질문에 필요한 요소들이 단계적으로 자연스럽게 연결되는가',
+    '추상적 표현에 머물지 않고 서로 다른 구체적 근거·예시·방법이 충분히 제시되어 답변이 입체적인가',
+    '반복·모순·불필요한 우회가 거의 없고 핵심을 한 번에 파악할 수 있을 만큼 완성도가 높은가',
+]
+
+ANSWER_STRUCTURE_SUBCHECKS = {
+    '질문에 직접 대응하는가': [
+        '질문과 같은 주제나 문제에 직접 답하고 있는가',
+        '답변의 중심 주제 또는 접근 방향이 분명한가',
+        '질문과 무관한 내용으로 크게 벗어나지 않았는가',
+        '질문을 회피하거나 동문서답하지 않았는가',
+    ],
+    '논리적으로 구성되어 있는가': [
+        '핵심 주장 또는 접근 방향이 제시되어 있는가',
+        '그 주장·방향을 뒷받침하는 이유나 설명이 있는가',
+        '설명의 순서가 자연스럽게 이어지는가',
+        '앞뒤 내용이 서로 모순되지 않는가',
+    ],
+    '구체적으로 설명하는가': [
+        '추상적인 표현만이 아니라 구체적인 개념·행동·방법 중 하나 이상이 있는가',
+        '무엇을 하겠는지 또는 무엇을 했는지 이해할 수 있을 정도로 설명하는가',
+        '주장을 뒷받침하는 세부 내용이 하나 이상 있는가',
+        '예시·기준·방법·과정 중 하나 이상으로 설명을 구체화했는가',
+    ],
+    '명료하고 일관되게 전달하는가': [
+        '불필요한 반복이 발견되지 않는가',
+        '지나치게 장황하거나 우회하는 표현이 두드러지지 않는가',
+        '문장과 문장 사이의 연결이 자연스러운가',
+        '답변의 핵심을 알아보기 쉬운가',
+    ],
+}
+
+
+class QuestionDraft(BaseModel):
+    question_type: Literal['직무이해', '문제해결', '협업']
+    question_text: str
+    question_reason: str
+    evaluation_points: List[str] = Field(description='공개자료 기반 평가 포인트 정확히 3개')
+    source_numbers: List[int]
+
+
+class QuestionSet(BaseModel):
+    questions: List[QuestionDraft]
+
+
+class DeepFollowUpDraft(BaseModel):
+    follow_up_question: str
+    follow_up_reason: str
+
+
+class JobCriterionChecklist(BaseModel):
+    checks: List[bool] = Field(min_length=5, max_length=5)
+    reason: str
+
+
+class AnswerCriterionChecklist(BaseModel):
+    checks: List[bool] = Field(min_length=4, max_length=4)
+    reason: str
+
+
+class AnswerAnalysisDraft(BaseModel):
+    job_checks: List[JobCriterionChecklist] = Field(min_length=3, max_length=3)
+    answer_checks: List[AnswerCriterionChecklist] = Field(min_length=4, max_length=4)
+    answer_excellence_checks: List[bool] = Field(min_length=4, max_length=4)
+    answer_excellence_reason: str
+    strengths: str
+    improvements: str
+
+
+class SessionCoachingResult(BaseModel):
+    content_summary: str
+    delivery_summary: str
+    priority_focus: str
+    next_practice_goal: str
+
+
+from encoding_utils import read_text_file as _read_text_file
+
+
+def _find_first_marker(text: str, markers: List[str], start: int = 0) -> int:
+    positions = [text.find(marker, start) for marker in markers]
+    positions = [pos for pos in positions if pos >= 0]
+    return min(positions) if positions else -1
+
+
+def _extract_multi_job_text(text: str, job: str) -> str:
+    """08_ 통합 JD에서 현재 선택한 직무 부분만 안전하게 추출한다."""
+    solution_start = _find_first_marker(text, ['A. Solution SW'])
+    system_start = _find_first_marker(
+        text,
+        [
+            'B. System Architecture / Software Solution',
+            'B. System Architecture · Software Solution',
+        ],
+    )
+    section_end = _find_first_marker(
+        text,
+        [
+            '==================================================\n2. 기존 자료에서 수정이 필요한 부분',
+            '==================================================\r\n2. 기존 자료에서 수정이 필요한 부분',
+        ],
+        start=max(system_start, 0),
+    )
+
+    if job == 'Solution SW':
+        if solution_start < 0 or system_start < 0:
+            return ''
+        return text[solution_start:system_start].strip()
+
+    if job == JOB_DEFAULT:
+        if system_start < 0:
+            return ''
+        end = section_end if section_end >= 0 else len(text)
+        return text[system_start:end].strip()
+
+    return ''
+
+
+def _level_from_checks(checks: List[bool], max_level: int) -> int:
+    return sum(1 for value in checks[:max_level] if value)
+
+
+def _score_from_levels(levels: List[int], max_level: int) -> int:
+    if not levels:
+        return 0
+    return round(sum(levels) / (len(levels) * max_level) * 100)
+
+
+def _qualitative_label(levels: List[int], max_level: int) -> str:
+    if not levels:
+        return '보완 필요'
+    ratio = sum(levels) / (len(levels) * max_level)
+    if ratio >= 0.75:
+        return '잘 드러남'
+    if ratio >= 0.375:
+        return '일부 드러남'
+    return '보완 필요'
+
+
+def _round_half_up(value: float) -> int:
+    return int(value + 0.5)
+
+
+def _answer_score_v8(
+    answer_levels: List[int],
+    excellence_checks: List[bool],
+) -> Dict[str, Any]:
+    # 기본 구성평가: 최대 95점
+    total_basic_checks = len(answer_levels) * ANSWER_MAX_LEVEL
+    passed_basic_checks = sum(answer_levels)
+
+    if total_basic_checks == 0:
+        base_exact = 0.0
+    else:
+        base_exact = (
+            passed_basic_checks
+            / total_basic_checks
+            * ANSWER_BASE_MAX_SCORE
+        )
+
+    # 우수답변 조건: 최대 +5점
+    excellence_count = sum(
+        1 for value in excellence_checks[:4] if value
+    )
+
+    excellence_bonus = (
+        excellence_count
+        / 4
+        * ANSWER_EXCELLENCE_MAX_BONUS
+    )
+
+    final_score = min(
+        100,
+        _round_half_up(base_exact + excellence_bonus)
+    )
+
+    return {
+        'base_score': _round_half_up(base_exact),
+        'excellence_bonus': round(excellence_bonus, 2),
+        'final_score': final_score,
+        'perfect_eligible': (
+            passed_basic_checks == total_basic_checks
+            and excellence_count == 4
+        ),
+    }
+
+
+class RagInterviewAI:
+    """Backend가 import해서 사용할 재명 파트 서비스 클래스."""
+
+    def __init__(
+        self,
+        base_path: Optional[str] = None,
+        company: str = COMPANY_DEFAULT,
+        job: str = JOB_DEFAULT,
+        openai_model: Optional[str] = None,
+        embedding_model: str = 'paraphrase-multilingual-MiniLM-L12-v2',
+    ):
+        self.base_path = base_path or os.environ.get('RAG_BASE_PATH')
+        if not self.base_path:
+            raise ValueError('RAG_BASE_PATH 또는 base_path가 필요합니다.')
+
+        self.company = company
+        self.job = job
+        self.llm = ChatOpenAI(
+            model=openai_model or os.environ.get('OPENAI_MODEL', 'gpt-5.4-mini'),
+            temperature=0,
+        )
+        self.embedding_model = SentenceTransformer(embedding_model)
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=100,
+            separators=['\n\n', '\n', '. ', ' ', ''],
+        )
+
+        self.documents: List[Document] = []
+        self.chunks: List[Document] = []
+        self.faiss_index = None
+        self._analysis_cache: Dict[str, Dict[str, Any]] = {}
+
+        self.question_set_llm = self.llm.with_structured_output(QuestionSet)
+        self.deep_followup_llm = self.llm.with_structured_output(DeepFollowUpDraft)
+        self.answer_analysis_llm = self.llm.with_structured_output(AnswerAnalysisDraft)
+        self.session_coaching_llm = self.llm.with_structured_output(SessionCoachingResult)
+
+    def load_and_index(self) -> None:
+        if not os.path.isdir(self.base_path):
+            raise FileNotFoundError(f'RAG 자료 폴더를 찾을 수 없습니다: {self.base_path}')
+
+        documents: List[Document] = []
+        for filename in sorted(os.listdir(self.base_path)):
+            full_path = os.path.join(self.base_path, filename)
+            if not os.path.isfile(full_path):
+                continue
+
+            matched_rule = None
+            for prefix, rule in SOURCE_RULES.items():
+                if filename.startswith(prefix):
+                    matched_rule = rule
+                    break
+            if matched_rule is None and not filename.lower().endswith('.pdf'):
+                continue
+
+            if filename.lower().endswith('.pdf'):
+                reader = PdfReader(full_path)
+                text = '\n'.join((page.extract_text() or '') for page in reader.pages).strip()
+            else:
+                text = _read_text_file(full_path).strip()
+            if not text:
+                continue
+
+            job_scope = matched_rule.get('job_scope', 'ALL') if matched_rule else 'ALL'
+
+            # 현재 선택 직무와 다른 직무의 전용자료는 인덱싱 단계에서 제외한다.
+            if job_scope not in ('ALL', 'MULTI', self.job):
+                continue
+
+            # 08_처럼 한 파일에 여러 직무가 함께 있으면 현재 직무 부분만 남긴다.
+            if job_scope == 'MULTI':
+                text = _extract_multi_job_text(text, self.job)
+                if not text:
+                    continue
+
+            metadata = {
+                'company': self.company,
+                'job': self.job if (matched_rule and matched_rule.get('scope') == 'job') else ('ALL' if not matched_rule else 'ALL'),
+                'interview_type': matched_rule['interview_type'] if matched_rule else 'ALL',
+                'category': matched_rule['category'] if matched_rule else 'job',
+                'source_type': matched_rule['source_type'] if matched_rule else 'official_job_description',
+                'source_title': filename,
+                'source_path': full_path,
+                'page': None,
+            }
+            documents.append(Document(page_content=text, metadata=metadata))
+
+        if not documents:
+            raise ValueError('RAG 원문 문서가 없습니다.')
+
+        self.documents = documents
+        self.chunks = self.text_splitter.split_documents(documents)
+        texts = [chunk.page_content for chunk in self.chunks]
+        vectors = self.embedding_model.encode(
+            texts,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).astype('float32')
+
+        self.faiss_index = faiss.IndexFlatIP(vectors.shape[1])
+        self.faiss_index.add(vectors)
+
+    def _ensure_index(self) -> None:
+        if self.faiss_index is None or not self.chunks:
+            raise RuntimeError('load_and_index()를 먼저 실행하세요.')
+
+    def _configure_context(self, company: str, job: str) -> None:
+        changed = company != self.company or job != self.job
+        if changed:
+            self.company = company
+            self.job = job
+            self.load_and_index()
+        else:
+            self._ensure_index()
+
+    def search_rag(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        self._ensure_index()
+        k = min(k, len(self.chunks))
+        query_vector = self.embedding_model.encode(
+            [query], convert_to_numpy=True, normalize_embeddings=True
+        ).astype('float32')
+        scores, indices = self.faiss_index.search(query_vector, k)
+
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < 0:
+                continue
+            chunk = self.chunks[idx]
+            results.append({
+                'content': chunk.page_content,
+                'metadata': chunk.metadata,
+                'score': float(score),
+            })
+        return results
+
+    def retrieve_question_sources(
+        self,
+        interview_type: str,
+        query_hint: str = '',
+        search_k: int = 20,
+        unique_k: int = 6,
+    ) -> List[Dict[str, Any]]:
+        if interview_type not in INTERVIEW_TYPES:
+            raise ValueError(f'지원하지 않는 면접유형입니다: {interview_type}')
+
+        query = (
+            f'{self.company} {self.job} {interview_type} '
+            f'직무 이해 문제 해결 협업 역량 면접 질문 평가 포인트 {query_hint}'
+        )
+        raw = self.search_rag(query, k=search_k)
+
+        sources, seen_titles = [], set()
+        for result in raw:
+            meta = result['metadata']
+            src_type = meta.get('interview_type', 'ALL')
+            if src_type not in ('ALL', interview_type):
+                continue
+
+            source_job = meta.get('job', 'ALL')
+            if source_job not in ('ALL', self.job):
+                continue
+
+            title = meta['source_title']
+            if title in seen_titles:
+                continue
+            seen_titles.add(title)
+            sources.append({
+                'source_no': len(sources) + 1,
+                'content': result['content'],
+                'source_title': title,
+                'interview_type': src_type,
+                'category': meta['category'],
+                'source_type': meta['source_type'],
+                'page': meta.get('page'),
+                'similarity': round(result['score'], 4),
+            })
+            if len(sources) >= unique_k:
+                break
+        return sources
+
+    @staticmethod
+    def _context(sources: List[Dict[str, Any]]) -> str:
+        return '\n'.join(
+            f"SOURCE {s['source_no']}\n자료명: {s['source_title']}\n"
+            f"자료유형: {s['category']}\n면접유형: {s['interview_type']}\n내용:\n{s['content']}\n"
+            for s in sources
+        )
+
+    @staticmethod
+    def _finalize_questions(drafts, sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        result = []
+        for draft in drafts:
+            evidence = []
+            for source_no in draft.source_numbers:
+                if 1 <= source_no <= len(sources):
+                    src = sources[source_no - 1]
+                    evidence.append({
+                        'source_title': src['source_title'],
+                        'category': src['category'],
+                        'interview_type': src['interview_type'],
+                        'page': src['page'],
+                        'similarity': src['similarity'],
+                    })
+            result.append({
+                'question_type': draft.question_type,
+                'question_text': draft.question_text,
+                'question_reason': draft.question_reason,
+                'evaluation_points': draft.evaluation_points[:3],
+                'rag_evidence': evidence,
+                'practice_reason': None,
+            })
+        return result
+
+    def generate_three_questions(
+        self, company: str, job: str, interview_type: str
+    ) -> List[Dict[str, Any]]:
+        self._configure_context(company, job)
+        if interview_type == 'AISK':
+            return self.generate_aisk_questions()
+        if interview_type == 'DEEP_INTERVIEW':
+            return [self.generate_deep_initial_question()]
+        raise ValueError(f'지원하지 않는 면접유형입니다: {interview_type}')
+
+    def generate_aisk_questions(self) -> List[Dict[str, Any]]:
+        sources = self.retrieve_question_sources('AISK')
+        prompt = f'''
+너는 기업·직무 맞춤형 A!SK 영상 모의면접 질문 생성 AI다.
+기업: {self.company}
+직무: {self.job}
+
+아래 RAG 자료만 근거로 질문을 정확히 3개 생성하라.
+- 직무이해 1개
+- 문제해결 1개
+- 협업 1개
+각 질문의 evaluation_points는 정확히 3개다.
+현재 선택 직무인 '{self.job}'의 업무와 역량만 사용하고 다른 직무의 업무를 섞지 않는다.
+기업 내부 평가기준과 합격 가능성은 추측하지 않는다.
+사용한 근거는 SOURCE 번호만 선택한다.
+
+[RAG 자료]
+{self._context(sources)}
+'''
+        response = self.question_set_llm.invoke(prompt)
+        order = {'직무이해': 0, '문제해결': 1, '협업': 2}
+        drafts = sorted(response.questions, key=lambda x: order.get(x.question_type, 99))[:3]
+        return self._finalize_questions(drafts, sources)
+
+    def generate_deep_initial_question(self) -> Dict[str, Any]:
+        sources = self.retrieve_question_sources('DEEP_INTERVIEW')
+        prompt = f'''
+너는 {self.company} {self.job} 심층 모의면접 질문 생성 AI다.
+아래 RAG 자료만 근거로 지원자의 직무 이해와 문제해결 사고를 깊게 확인할 첫 질문을 정확히 1개 생성하라.
+evaluation_points는 정확히 3개다.
+현재 선택 직무인 '{self.job}'의 업무와 역량만 사용하고 다른 직무의 업무를 섞지 않는다.
+기업 내부 평가기준은 추측하지 않는다.
+
+[RAG 자료]
+{self._context(sources)}
+'''
+        response = self.question_set_llm.invoke(prompt)
+        if not response.questions:
+            raise ValueError('심층면접 첫 질문 생성 실패')
+        return self._finalize_questions([response.questions[0]], sources)[0]
+
+    def generate_deep_followup_question(
+        self,
+        current_question: Dict[str, Any],
+        stt_text: str,
+    ) -> Dict[str, str]:
+        prompt = f'''
+너는 기업·직무 심층면접의 꼬리질문 생성 AI다.
+
+[현재 질문]
+{current_question['question_text']}
+
+[공개자료 기반 평가포인트]
+{json.dumps(current_question.get('evaluation_points', []), ensure_ascii=False)}
+
+[지원자 STT 답변]
+{stt_text}
+
+답변에서 더 구체적으로 확인할 한 가지를 골라 꼬리질문을 정확히 1개 생성하라.
+이미 충분히 설명된 내용을 반복하지 말고 현재 질문과 평가포인트 범위를 벗어나지 않는다.
+기업 내부 평가기준과 합격 가능성은 추측하지 않는다.
+PoC에서는 추가 연쇄 꼬리질문을 생성하지 않는다.
+'''
+        return self.deep_followup_llm.invoke(prompt).model_dump()
+
+    def generate_session_coaching(self, session_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        scored_items = []
+        for item in session_items:
+            analysis = item.get('answer_analysis', {})
+            answer_score = analysis.get('answer_score')
+            job_score = analysis.get('job_score')
+            if answer_score is not None and job_score is not None:
+                combined = round((float(answer_score) + float(job_score)) / 2, 1)
+            elif answer_score is not None:
+                combined = float(answer_score)
+            elif job_score is not None:
+                combined = float(job_score)
+            else:
+                combined = None
+            scored_items.append({**item, '_combined_score': combined})
+
+        numeric_scores = [i['_combined_score'] for i in scored_items if i['_combined_score'] is not None]
+        overall_score = round(sum(numeric_scores) / len(numeric_scores), 1) if numeric_scores else None
+
+        prompt_items = []
+        for item in scored_items:
+            q = item.get('question', {})
+            a = item.get('answer_analysis', {})
+            prompt_items.append({
+                'question_type': q.get('question_type'),
+                'job_score': a.get('job_score'),
+                'answer_score': a.get('answer_score'),
+                'combined_score': item['_combined_score'],
+                'job_evaluation': a.get('job_evaluation'),
+                'answer_evaluation': a.get('answer_evaluation'),
+                'strengths': a.get('strengths'),
+                'improvements': a.get('improvements'),
+            })
+
+        prompt = f'''
+모의면접 1회 전체 결과를 종합하여 짧고 구체적인 코칭을 작성하라.
+점수는 아래 계산값을 그대로 참고하고 새로 산정하지 않는다.
+
+[답변별 결과]
+{json.dumps(prompt_items, ensure_ascii=False)}
+
+규칙:
+- content_summary: 답변 내용의 공통 특징을 1~2문장으로 요약
+- delivery_summary: 분석 결과에서 확인되는 답변 구성 특징을 1~2문장으로 요약
+- priority_focus: 가장 우선적인 개선점 1가지
+- next_practice_goal: 다음 면접에서 실행할 구체적 행동 1가지
+- 합격/불합격, 감정, 성격을 추측하지 않는다.
+- 점수를 근거로 사용하되 점수 외의 근거를 꾸며내지 않는다.
+'''.strip()
+        result = self.session_coaching_llm.invoke(prompt).model_dump()
+        result['overall_score'] = overall_score
+        result['scoring_version'] = SCORING_VERSION
+        return result
+
+    def generate_followup_question(
+        self, previous_session: Dict[str, Any], company: str, job: str, interview_type: str
+    ) -> Dict[str, Any]:
+        self._configure_context(company, job)
+        final_coaching = previous_session.get('final_coaching', {})
+        priority_focus = final_coaching.get('priority_focus', '')
+        next_practice_goal = final_coaching.get('next_practice_goal', '')
+        previous_questions = []
+        for item in previous_session.get('questions', []):
+            q = item.get('question', item)
+            if isinstance(q, dict) and q.get('question_text'):
+                previous_questions.append(q['question_text'])
+
+        sources = self.retrieve_question_sources(
+            interview_type,
+            query_hint=f'우선 개선점 {priority_focus} 다음 연습 목표 {next_practice_goal}',
+            search_k=20,
+            unique_k=6,
+        )
+        context = self._context(sources)
+        prompt = f'''
+너는 기업·직무 맞춤형 면접 연습 질문 생성 AI다.
+기업: {company}
+직무: {job}
+면접유형: {interview_type}
+
+[이전 질문들]
+{json.dumps(previous_questions, ensure_ascii=False)}
+
+[이전 우선 개선점]
+{priority_focus}
+
+[다음 연습 목표]
+{next_practice_goal}
+
+아래 RAG 자료만 사용하여 이전 약점을 다시 연습할 수 있는 후속 질문 1개를 생성하라.
+evaluation_points는 정확히 3개다.
+이전 질문을 그대로 반복하지 않는다.
+사용한 근거는 SOURCE 번호로만 선택한다.
+기업 내부 평가기준이나 합격 가능성은 추측하지 않는다.
+
+[RAG 자료]
+{context}
+'''.strip()
+        draft = self.question_set_llm.invoke(prompt)
+        question = draft.questions[0] if draft.questions else None
+        if question is None:
+            raise ValueError('후속 질문 생성 실패')
+        finalized = self._finalize_questions([question], sources)[0]
+        finalized['practice_reason'] = (
+            f'1회차 우선 개선점({priority_focus})과 다음 연습 목표({next_practice_goal})를 반영한 후속 질문'
+        )
+        return finalized
+
+    def _analysis_cache_key(
+        self,
+        question_data: Dict[str, Any],
+        stt_text: str,
+    ) -> str:
+        payload = {
+            'scoring_version': SCORING_VERSION,
+            'company': self.company,
+            'job': self.job,
+            'question_text': question_data.get('question_text', ''),
+            'evaluation_points': question_data.get('evaluation_points', [])[:3],
+            'job_subcheck_labels': JOB_SUBCHECK_LABELS,
+            'answer_structure_criteria': ANSWER_STRUCTURE_CRITERIA,
+            'answer_excellence_labels': ANSWER_EXCELLENCE_LABELS,
+            'stt_text': ' '.join(stt_text.split()),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+    def _analyze_answer_once(
+        self,
+        question_data: Dict[str, Any],
+        stt_text: str,
+    ) -> Dict[str, Any]:
+        job_criteria = question_data.get('evaluation_points', [])[:3]
+        if len(job_criteria) != 3:
+            raise ValueError('evaluation_points는 정확히 3개가 필요합니다.')
+
+        prompt = f'''
+너는 모의면접 답변 분석 AI다.
+기업 내부 평가표가 아니라 아래 공개자료 기반 평가포인트와 답변 구성 기준만 사용한다.
+
+[질문]
+{question_data['question_text']}
+
+[공개자료 기반 직무 평가포인트]
+{json.dumps(job_criteria, ensure_ascii=False)}
+
+[직무 평가포인트별 공통 세부조건 - 반드시 이 순서로 5개]
+{json.dumps(JOB_SUBCHECK_LABELS, ensure_ascii=False)}
+
+[답변 구성 기준과 각 세부조건]
+{json.dumps(ANSWER_STRUCTURE_SUBCHECKS, ensure_ascii=False)}
+
+[답변 구성 우수성 보너스 조건 - 반드시 이 순서로 4개]
+{json.dumps(ANSWER_EXCELLENCE_LABELS, ensure_ascii=False)}
+
+[STT 답변]
+{stt_text}
+
+반드시 다음 규칙을 지켜라.
+- 점수나 레벨을 직접 선택하지 않는다.
+- 직무 평가포인트 3개 각각에 대해 세부조건 5개를 순서대로 True/False로만 판단한다.
+- 답변 구성 기준 4개 각각에 대해 해당 기준의 세부조건 4개를 순서대로 True/False로만 판단한다.
+- 마지막으로 답변 구성 우수성 보너스 조건 4개를 별도로 True/False 판단한다.
+- STT 답변에 실제로 드러난 내용만 근거로 판단하고, 말하지 않은 직무지식·경험은 추측하지 않는다.
+- 단순히 관련 전문용어가 있다는 이유만으로 여러 직무 세부조건을 동시에 True로 만들지 않는다.
+- 직무 세부조건의 True는 답변 안에 그 조건을 뒷받침하는 내용이 실제로 있을 때만 선택한다.
+- 직무 평가포인트 3개는 서로 독립적으로 판단한다.
+- 한 평가포인트에서 인정한 좋은 설명을 다른 평가포인트의 충족 근거로 자동 재사용하지 않는다.
+- 측정→분석→최적화→검증 같은 일반적인 문제해결 절차만으로 서로 다른 평가포인트를 모두 높게 평가하지 않는다.
+- 각 평가포인트에만 있는 핵심 요구요소가 답변에서 실제로 다뤄졌는지 먼저 확인한다.
+- 평가포인트가 '실제 AI 워크로드', '차세대 메모리', 'HW-SW', '협업' 등 특정 조건을 포함하면 그 조건과 답변 내용이 직접 연결되어야 한다.
+- 특정 평가포인트의 핵심 요구요소가 빠졌다면 다른 평가포인트의 좋은 설명으로 대신 충족시키지 않는다.
+- 1번째 직무 세부조건은 관련 단어를 단순 언급하는 것만으로는 부족하며 평가포인트의 핵심 요구에 실제로 답해야 True다.
+- 2번째 직무 세부조건은 단순 정의만 있으면 부족하다. 질문에 필요한 의미·이유·원인·영향·관계 중 적절한 논리 연결이 실제로 설명되어야 True다.
+- 3번째 직무 세부조건은 판단 기준·근거·지표·사례 중 해당 평가항목에 자연스럽게 맞는 것이 하나 이상 구체적으로 드러나야 True다.
+- 5번째 직무 세부조건은 기술 질문에서는 재측정·검증, 경험 질문에서는 결과·성과·학습·후속 적용처럼 질문 성격에 맞게 판단한다.
+
+[직무 평가와 답변 구성 평가를 반드시 분리한다]
+- 직무 평가는 '무엇을 알고 얼마나 충분하게 말했는가'를 본다.
+- 답변 구성 평가는 '그 내용을 얼마나 조직적이고 명료하게 말했는가'만 본다.
+- 특정 직무 개념, 지표, 메모리 영향, 검증 방법 등이 빠졌다는 이유만으로 답변 구성 기본 체크를 False로 만들지 않는다. 그런 부족함은 직무 평가에서 반영한다.
+- '질문에 직접 대응하는가'는 답변이 같은 문제·주제에 직접 답하고 접근 방향을 제시하면 충족 가능하다.
+- '논리적으로 구성되어 있는가'는 답변 내부의 주장→이유→방법 순서와 앞뒤 일관성을 본다.
+- '구체적으로 설명하는가'에서는 구체적 개념·행동·방법 자체가 확인되면 기본 체크에서는 인정할 수 있다.
+- '명료하고 일관되게 전달하는가'는 답변 전체를 보고 반복·장황함·문장 연결·핵심 파악 용이성을 판단한다.
+- 짧다는 이유만으로 기본 구성평가를 낮추지 않는다. 짧아도 직접적이고 논리적이며 이해 가능하면 기본 구성점수는 높을 수 있다.
+
+[우수답변 보너스 조건은 엄격하게 판단한다]
+- 이 4개 조건은 기본 구성평가와 별도로 높은 답변 완성도를 보상하기 위한 조건이다.
+- 기본 구성 체크가 모두 True라는 이유만으로 우수답변 조건도 자동으로 True로 만들지 않는다.
+- 단순히 짧고 오류가 없거나, 반복·모순이 없다는 이유만으로 우수답변 조건을 True로 만들지 않는다.
+- 1번째 조건은 핵심 결론·입장·접근 방향이 답변 초반부터 명확하고 답변 전체가 그 중심을 유지할 때만 True다.
+- 2번째 조건은 질문에 맞는 복수의 설명 단계가 실제로 연결되어 있어야 한다. 단순 나열은 False다.
+- 3번째 조건은 한 가지 전문용어나 한 가지 행동만 언급한 정도로는 부족하다. 서로 다른 구체적 근거·예시·방법이 충분히 있어야 True다.
+- 4번째 조건은 단순히 큰 오류가 없는 수준이 아니라 압축도, 흐름, 핵심 전달력이 모두 뛰어난 경우에만 True다.
+- 조금이라도 판단 근거가 부족하면 우수답변 조건은 False로 둔다.
+
+- 신입 지원자에게 실제 현업 경험이나 회사 내부 수치를 요구하지 않는다.
+- 각 평가항목마다 전체 판단 이유를 한 문장으로 반환한다.
+- answer_excellence_reason에는 우수성 보너스 조건을 얼마나 충족했는지 핵심 이유를 한 문장으로 반환한다.
+- strengths와 improvements는 체크 결과에 근거해 작성한다.
+- 합격/불합격, 기업 내부 채점기준, 성격·감정·자신감은 추측하지 않는다.
+'''
+        result = self.answer_analysis_llm.invoke(prompt)
+
+        job_levels = [
+            _level_from_checks(item.checks, JOB_MAX_LEVEL)
+            for item in result.job_checks
+        ]
+        answer_levels = [
+            _level_from_checks(item.checks, ANSWER_MAX_LEVEL)
+            for item in result.answer_checks
+        ]
+        excellence_checks = list(result.answer_excellence_checks)
+        raw_answer_score = _score_from_levels(answer_levels, ANSWER_MAX_LEVEL)
+        answer_score_result = _answer_score_v8(
+            answer_levels,
+            excellence_checks,
+        )
+        answer_score = answer_score_result['final_score']
+
+        return {
+            'scoring_version': SCORING_VERSION,
+            'job_evaluation': _qualitative_label(job_levels, JOB_MAX_LEVEL),
+            'answer_evaluation': _qualitative_label(answer_levels, ANSWER_MAX_LEVEL),
+            'job_score': _score_from_levels(job_levels, JOB_MAX_LEVEL),
+            'answer_score': answer_score,
+            'answer_raw_score': raw_answer_score,
+            'answer_base_score': answer_score_result['base_score'],
+            'answer_excellence_bonus': answer_score_result['excellence_bonus'],
+            'answer_perfect_eligible': answer_score_result['perfect_eligible'],
+            'answer_excellence_checks': excellence_checks,
+            'answer_excellence_labels': ANSWER_EXCELLENCE_LABELS,
+            'answer_excellence_reason': result.answer_excellence_reason,
+            'strengths': result.strengths,
+            'improvements': result.improvements,
+            'job_criteria': [
+                {
+                    'criterion': criterion,
+                    'level': job_levels[i],
+                    'max_level': JOB_MAX_LEVEL,
+                    'checks': list(result.job_checks[i].checks),
+                    'check_labels': JOB_SUBCHECK_LABELS,
+                    'reason': result.job_checks[i].reason,
+                }
+                for i, criterion in enumerate(job_criteria)
+            ],
+            'answer_criteria': [
+                {
+                    'criterion': criterion,
+                    'level': answer_levels[i],
+                    'max_level': ANSWER_MAX_LEVEL,
+                    'checks': list(result.answer_checks[i].checks),
+                    'check_labels': ANSWER_STRUCTURE_SUBCHECKS[criterion],
+                    'reason': result.answer_checks[i].reason,
+                }
+                for i, criterion in enumerate(ANSWER_STRUCTURE_CRITERIA)
+            ],
+        }
+
+    def analyze_answer(
+        self,
+        question_data: Dict[str, Any],
+        stt_text: str,
+        use_cache: bool = True,
+    ) -> Dict[str, Any]:
+        cache_key = self._analysis_cache_key(question_data, stt_text)
+
+        if use_cache and cache_key in self._analysis_cache:
+            cached = copy.deepcopy(self._analysis_cache[cache_key])
+            cached['cache_hit'] = True
+            return cached
+
+        analyzed = self._analyze_answer_once(question_data, stt_text)
+        analyzed['cache_hit'] = False
+
+        if use_cache:
+            self._analysis_cache[cache_key] = copy.deepcopy(analyzed)
+
+        return analyzed
+
+    def check_analysis_repeatability(
+        self,
+        question_data: Dict[str, Any],
+        stt_text: str,
+        repeats: int = 3,
+    ) -> Dict[str, Any]:
+        if repeats < 2:
+            raise ValueError('repeats는 2 이상이어야 합니다.')
+
+        cache_key = self._analysis_cache_key(question_data, stt_text)
+        self._analysis_cache.pop(cache_key, None)
+
+        runs = [self.analyze_answer(question_data, stt_text, use_cache=True) for _ in range(repeats)]
+        job_scores = [r['job_score'] for r in runs]
+        answer_scores = [r['answer_score'] for r in runs]
+
+        return {
+            'mode': 'service_cached_repeatability',
+            'scoring_version': SCORING_VERSION,
+            'repeats': repeats,
+            'job_scores': job_scores,
+            'job_range': max(job_scores) - min(job_scores),
+            'job_std': round(statistics.pstdev(job_scores), 3),
+            'answer_scores': answer_scores,
+            'answer_range': max(answer_scores) - min(answer_scores),
+            'answer_std': round(statistics.pstdev(answer_scores), 3),
+            'cache_hits': [r.get('cache_hit', False) for r in runs],
+            'raw_runs': runs,
+        }
+
+    def check_raw_llm_variability(
+        self,
+        question_data: Dict[str, Any],
+        stt_text: str,
+        repeats: int = 3,
+    ) -> Dict[str, Any]:
+        if repeats < 2:
+            raise ValueError('repeats는 2 이상이어야 합니다.')
+
+        runs = [self._analyze_answer_once(question_data, stt_text) for _ in range(repeats)]
+        job_scores = [r['job_score'] for r in runs]
+        answer_scores = [r['answer_score'] for r in runs]
+
+        return {
+            'mode': 'raw_llm_variability',
+            'scoring_version': SCORING_VERSION,
+            'repeats': repeats,
+            'job_scores': job_scores,
+            'job_range': max(job_scores) - min(job_scores),
+            'job_std': round(statistics.pstdev(job_scores), 3),
+            'answer_scores': answer_scores,
+            'answer_range': max(answer_scores) - min(answer_scores),
+            'answer_std': round(statistics.pstdev(answer_scores), 3),
+            'raw_runs': runs,
+        }
