@@ -33,7 +33,15 @@
 - 직무 핵심 반영도 / 답변 구성 충실도
 - 세션 내용 종합 코칭
 
-심층면접의 꼬리질문은 현재 직전 질문의 공개자료 기반 `evaluation_points`와 `rag_evidence` 범위를 이어받아, 기존 V8 답변 평가 체계를 그대로 사용할 수 있게 연결했다.
+심층면접 꼬리질문은 현재 실제 웹 런타임에서도 최상위 RAG 통합 규격과 같은 형식을 사용한다.
+각 꼬리질문마다 다음 값이 함께 생성된다.
+- `question_text`
+- `question_reason`
+- `evaluation_points` 3개
+- `rag_evidence`
+- `practice_reason`
+
+이를 위해 `backend/rag_ai/deep_followup_contract.py`를 추가했고, 실제 FastAPI 심층면접 API가 이 통합 형식을 사용한다.
 
 ### 2. 상세 STT / 말하기 습관
 답변 제출 시 기본 STT와 별도로 상세 STT를 실행한다.
@@ -60,7 +68,17 @@
 - 실제 오디오 품질이 측정 불가이면 내용평가를 강행하지 않고 재녹화를 권장
 - 영상 얼굴 분석이 실패해도 가능한 경우 오디오 품질 검사는 별도로 유지
 
-### 4. 리포트
+### 4. RAG/언어 AI 결과 형식 정리
+현재 질문 생성·답변 평가·최종 코칭의 핵심 필드는 이미 통일되어 있다.
+
+- 질문: `question_type`, `question_text`, `question_reason`, `evaluation_points`, `rag_evidence`, `practice_reason`
+- 답변 평가 DB 저장값: `scoring_version`, `job_evaluation`, `answer_evaluation`, `job_score`, `answer_score`, `strengths`, `improvements`
+- 최종 코칭: `content_summary`, `delivery_summary`, `priority_focus`, `next_practice_goal`, `overall_score`
+
+RAG가 계산하는 `answer_raw_score`, `answer_base_score`, `answer_excellence_bonus` 등 상세 계산값은 현재 DB에 저장하지 않는 값으로 통합 규격에 명확히 구분했다.
+즉 현재 웹 리포트와 세션 코칭에 필요한 핵심 결과는 DB에 저장하고, 내부 검증용 세부 계산값은 RAG 런타임 결과로 유지한다.
+
+### 5. 리포트
 현재 리포트에서 구분한다.
 
 - `내용 종합 점수`: 현재 `overall_score`의 정확한 의미
