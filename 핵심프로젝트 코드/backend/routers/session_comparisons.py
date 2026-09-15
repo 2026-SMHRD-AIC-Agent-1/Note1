@@ -1,15 +1,15 @@
 """
 SESSION_COMPARISONS 관련 API — 1회차 vs 2회차 비교
 ----------------------------------------------------
-같은 사용자의 두 세션에서 비언어 지표 평균을 계산해 변화량을 저장합니다.
+같은 사용자의 두 세션에서 내용 종합점수와 기존 비언어 참고값의 변화량을 저장합니다.
 
-종합 점수 비교는 답변 분석에서 계산된 job_score와 answer_score를 평균한
-회차 점수(overall_score)를 기준으로 동작합니다. 비언어 데이터가 없어도
-1회차/2회차 점수 비교가 가능하고, 비언어 데이터가 들어오면 추가 지표도 함께 비교합니다.
+현재 overall_score는 job_score와 answer_score를 바탕으로 계산한 '내용 종합점수'입니다.
+전달 안정성 최종 점수는 아직 포함하지 않습니다.
+머뭇거림 표현/반복 표현은 리포트 전용이므로 회차 점수 비교 항목에서 제외합니다.
 """
 
 from statistics import mean
-from typing import List, Optional
+from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -20,11 +20,11 @@ from models import InterviewSessions, InterviewQuestions, UserAnswers, SessionCo
 
 router = APIRouter(prefix="/session-comparisons", tags=["SessionComparisons"])
 
-# 비교에 사용할 비언어 지표 (숫자형만 — voice_emotion_label 등 문자열 필드는 제외)
-COMPARISON_METRICS = [
+# 캘리브레이션 기반 새 전달 안정성 구조가 서비스에 연결되기 전까지 사용하는
+# 기존 숫자형 참고 지표입니다. 머뭇거림/반복 표현은 점수·비교 지표에서 제외합니다.
+LEGACY_REFERENCE_METRICS = [
     "gaze_center_ratio",
     "speaking_speed",
-    "filler_word_count",
     "pause_count",
     "average_volume",
     "pitch_variation",
@@ -33,12 +33,12 @@ COMPARISON_METRICS = [
 
 
 def _session_metric_averages(db: Session, session_id: int) -> dict:
-    """세션에 속한 모든 답변의 비언어 지표 평균을 계산합니다."""
+    """세션에 속한 모든 답변의 기존 비언어 참고값 평균을 계산합니다."""
     questions = db.exec(
         select(InterviewQuestions).where(InterviewQuestions.session_id == session_id)
     ).all()
 
-    values: dict = {m: [] for m in COMPARISON_METRICS}
+    values: dict = {m: [] for m in LEGACY_REFERENCE_METRICS}
     for q in questions:
         answer = db.exec(
             select(UserAnswers).where(UserAnswers.question_id == q.question_id)
@@ -46,7 +46,7 @@ def _session_metric_averages(db: Session, session_id: int) -> dict:
         if not answer or not answer.nonverbal_metric:
             continue
         metric = answer.nonverbal_metric
-        for name in COMPARISON_METRICS:
+        for name in LEGACY_REFERENCE_METRICS:
             value = getattr(metric, name, None)
             if value is not None:
                 values[name].append(float(value))
@@ -72,7 +72,7 @@ def create_session_comparison(req: CreateComparisonRequest, db: Session = Depend
     b = _session_metric_averages(db, req.second_session_id)
 
     changed_lines = []
-    for metric in COMPARISON_METRICS:
+    for metric in LEGACY_REFERENCE_METRICS:
         av, bv = a[metric], b[metric]
         if av is not None and bv is not None:
             changed_lines.append(f"{metric}: {av:.2f} -> {bv:.2f} (변화 {bv - av:+.2f})")
@@ -85,16 +85,20 @@ def create_session_comparison(req: CreateComparisonRequest, db: Session = Depend
 
     score_line = None
     if first_score is not None and second_score is not None:
-        direction = '향상' if score_change > 0 else ('하락' if score_change < 0 else '변화 없음')
-        score_line = f'종합점수: {first_score:.1f} -> {second_score:.1f} ({score_change:+.1f}, {direction})'
+        direction = "향상" if score_change > 0 else ("하락" if score_change < 0 else "변화 없음")
+        score_line = (
+            f"내용 종합점수: {first_score:.1f} -> {second_score:.1f} "
+            f"({score_change:+.1f}, {direction})"
+        )
 
     summary_lines = []
     if score_line:
         summary_lines.append(score_line)
     if changed_lines:
+        summary_lines.append("기존 비언어 참고값:")
         summary_lines.extend(changed_lines)
     elif not score_line:
-        summary_lines.append('비언어 및 종합점수 데이터가 없어 비교할 수치가 없습니다.')
+        summary_lines.append("내용 종합점수와 기존 비언어 참고값이 없어 비교할 수치가 없습니다.")
 
     comparison = SessionComparisons(
         first_session_id=req.first_session_id,
