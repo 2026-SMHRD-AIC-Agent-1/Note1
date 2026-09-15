@@ -1,13 +1,16 @@
 """
-routers/uploads.py — 답변 녹화 파일 업로드 → STT → (가능하면) 분석까지 한 번에
-------------------------------------------------------------------------------
-프론트는 녹화 시작/종료 + MediaRecorder Blob 생성 + FormData 전송만 담당합니다.
-백엔드는 저장 -> 기본 STT -> 내용 분석 -> 상세 STT 안정성 분석까지 이어서 수행합니다.
+routers/uploads.py — 답변 녹화 파일 업로드 → STT → 내용/전달 분석
+-------------------------------------------------------------------
+프론트는 MediaRecorder Blob을 FormData로 전송하고, 백엔드는 아래를 순서대로 수행합니다.
 
-상세 STT 안정성 분석은 최종 점수를 만들지 않습니다.
-- 머뭇거림 표현/반복 표현: 리포트 전용
-- 단어 timestamp가 있으면 발생 시점을 NONVERBAL_EVENTS에 저장
-- 발화 속도 관련 raw feature는 응답으로 전달하되 최종 점수 기준은 아직 적용하지 않음
+1. 음성/영상 저장
+2. 기본 STT -> 내용평가용 텍스트 저장
+3. 상세 STT -> 머뭇거림/반복 표현 + 속도 raw feature
+4. 로컬 비언어 AI -> 실제 음성/영상 측정 + delivery_profile 생성
+5. 안전한 타임라인 이벤트 저장
+6. 오디오 측정이 유효할 때만 RAG·언어 AI 내용평가
+
+최종 전달 안정성 0~100 점수는 아직 만들지 않습니다.
 """
 
 import os
@@ -34,6 +37,7 @@ from stt_service import (
     MAX_AUDIO_MB,
 )
 from stt_stability_features import analyze_stt_stability
+from nonverbal_service import analyze_answer_delivery
 from ai_service_client import get_ai_service, is_ready as ai_is_ready
 from path_config import resolve_project_path
 
@@ -50,11 +54,20 @@ MAX_VIDEO_MB = 300
 MAX_AUDIO_BYTES = MAX_AUDIO_MB * 1024 * 1024
 MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024
 
-# 상세 STT에서 자동 생성하는 타임라인 이벤트.
-# 재제출 시 이 두 종류만 지웠다가 다시 생성하여 중복 누적을 막습니다.
 STT_EVENT_TYPES = {"SPEECH_HESITATION", "SPEECH_REPETITION"}
+AUTO_DELIVERY_EVENT_TYPES = {
+    "GAZE_AWAY",
+    "FACE_TURNED",
+    "LONG_BLINK",
+    "SMILE",
+    "EXPRESSION_CHANGE",
+    "NOD",
+    "SHAKE",
+    "BODY_MOVEMENT",
+    "HAND_GESTURE",
+    "LONG_PAUSE",
+}
 
-# 브라우저가 보내는 Content-Type도 함께 확인합니다 (확장자만으로는 위조가 쉬움).
 ALLOWED_AUDIO_CONTENT_TYPES = {
     "audio/webm",
     "audio/mpeg",
@@ -72,7 +85,6 @@ ALLOWED_VIDEO_CONTENT_TYPES = {
 
 
 async def _save_upload_with_limit(upload: UploadFile, destination: Path, max_bytes: int) -> int:
-    """업로드 전체를 메모리에 올리지 않고 chunk 단위로 저장하고 크기를 제한합니다."""
     total = 0
     chunk_size = 1024 * 1024
     try:
@@ -107,7 +119,6 @@ def _validate_video_file(path: Path, content_type: Optional[str] = None) -> None
 
 
 def _safe_media_path(raw_path: str) -> Path:
-    """저장된 경로가 UPLOAD_ROOT 밖을 가리키지 않는지 확인합니다."""
     path = Path(raw_path).resolve()
     if UPLOAD_ROOT not in path.parents and path != UPLOAD_ROOT:
         raise HTTPException(status_code=404, detail="미디어 파일을 찾을 수 없습니다.")
@@ -117,7 +128,6 @@ def _safe_media_path(raw_path: str) -> Path:
 
 
 def _build_stt_stability_payload(features: dict) -> dict:
-    """프론트가 바로 쓸 수 있도록 상세 STT 결과 중 필요한 값만 정리합니다."""
     return {
         "status": "available",
         "word_timestamps_available": bool(features.get("word_timestamps_available")),
@@ -134,20 +144,23 @@ def _build_stt_stability_payload(features: dict) -> dict:
             "gap_0_5_count": features.get("pause_gap_0_5_count"),
             "gap_1_0_count": features.get("pause_gap_1_0_count"),
             "max_word_gap_sec": features.get("max_word_gap_sec"),
-            "note": "단어 timestamp 기반 gap은 보조값이며 최종 침묵 평가는 음성 신호 분석을 사용합니다.",
+            "note": "단어 timestamp gap은 보조값이며 최종 침묵 평가는 실제 음성 신호 분석을 사용합니다.",
         },
         "scoring_note": "머뭇거림 표현과 반복 표현은 점수에 반영하지 않습니다.",
     }
 
 
-def _replace_stt_timeline_events(session: Session, answer_id: int, features: dict) -> int:
-    """상세 STT의 말하기 습관 발생 시점을 타임라인 이벤트로 저장합니다."""
+def _delete_auto_events(session: Session, answer_id: int, event_types: set[str]) -> None:
     existing_events = session.exec(
         select(NonverbalEvents).where(NonverbalEvents.answer_id == answer_id)
     ).all()
     for event in existing_events:
-        if event.event_type in STT_EVENT_TYPES:
+        if event.event_type in event_types:
             session.delete(event)
+
+
+def _replace_stt_timeline_events(session: Session, answer_id: int, features: dict) -> int:
+    _delete_auto_events(session, answer_id, STT_EVENT_TYPES)
 
     speech_habits = features.get("speech_habits_report") or {}
     saved_count = 0
@@ -186,6 +199,29 @@ def _replace_stt_timeline_events(session: Session, answer_id: int, features: dic
     return saved_count
 
 
+def _replace_delivery_timeline_events(session: Session, answer_id: int, events: list[dict]) -> int:
+    _delete_auto_events(session, answer_id, AUTO_DELIVERY_EVENT_TYPES)
+    saved_count = 0
+    for item in events or []:
+        event_type = item.get("event_type")
+        start = item.get("start_time_sec")
+        if event_type not in AUTO_DELIVERY_EVENT_TYPES or not isinstance(start, (int, float)):
+            continue
+        end = item.get("end_time_sec")
+        session.add(
+            NonverbalEvents(
+                answer_id=answer_id,
+                event_type=event_type,
+                start_time_sec=float(start),
+                end_time_sec=float(end) if isinstance(end, (int, float)) else None,
+                value=item.get("value"),
+            )
+        )
+        saved_count += 1
+    session.commit()
+    return saved_count
+
+
 @router.post("/user-answers/submit")
 async def submit_answer(
     session: Session = Depends(get_session),
@@ -196,18 +232,6 @@ async def submit_answer(
     audio: UploadFile = File(...),
     video: Optional[UploadFile] = File(default=None),
 ):
-    """
-    답변 녹화 파일을 업로드받아 아래 순서로 처리합니다.
-
-    1. 음성/영상 저장
-    2. 기본 STT -> USER_ANSWERS.stt_text 저장
-    3. ANALYSIS 동의가 있으면 상세 STT -> 말하기 습관/속도 raw feature 계산
-    4. 머뭇거림/반복 표현 timestamp를 NONVERBAL_EVENTS에 저장
-    5. 가능하면 RAG·언어 AI 답변 분석
-
-    상세 STT 분석 실패는 기본 STT/내용평가를 실패시키지 않습니다.
-    """
-    # 1. 권한/존재 확인
     question = session.get(InterviewQuestions, question_id)
     if not question or question.session_id != session_id:
         raise HTTPException(status_code=400, detail="해당 세션의 질문이 아닙니다.")
@@ -217,22 +241,13 @@ async def submit_answer(
     from routers.consents import has_active_consent
 
     if not has_active_consent(session, user_id, "AUDIO_RECORDING"):
-        raise HTTPException(
-            status_code=403,
-            detail="음성 저장 동의가 확인되지 않았습니다. 먼저 POST /consents로 "
-                   "AUDIO_RECORDING 동의를 받아야 답변을 업로드할 수 있습니다.",
-        )
+        raise HTTPException(status_code=403, detail="음성 저장 동의(AUDIO_RECORDING)가 필요합니다.")
     if video is not None and not has_active_consent(session, user_id, "VIDEO_RECORDING"):
-        raise HTTPException(
-            status_code=403,
-            detail="영상 저장 동의가 확인되지 않았습니다. 먼저 POST /consents로 "
-                   "VIDEO_RECORDING 동의를 받거나, 영상 없이(음성만) 제출하세요.",
-        )
+        raise HTTPException(status_code=403, detail="영상 저장 동의(VIDEO_RECORDING)가 필요합니다.")
 
     analysis_consent = has_active_consent(session, user_id, "ANALYSIS")
 
     try:
-        # 2. 파일 저장
         if audio.content_type and audio.content_type not in ALLOWED_AUDIO_CONTENT_TYPES:
             raise ValueError(f"허용되지 않은 음성 Content-Type: {audio.content_type}")
         audio_suffix = Path(audio.filename or "answer.webm").suffix or ".webm"
@@ -252,7 +267,6 @@ async def submit_answer(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # 3. USER_ANSWERS 생성 또는 갱신
     existing = session.exec(
         select(UserAnswers).where(UserAnswers.question_id == question_id)
     ).first()
@@ -270,13 +284,12 @@ async def submit_answer(
     session.commit()
     session.refresh(answer)
 
-    # 4. 기본 STT — 내용평가가 사용하는 텍스트 경로는 기존 그대로 유지
     if not stt_is_ready():
         raise HTTPException(
             status_code=503,
-            detail="STT 서비스가 초기화되지 않았습니다 (OPENAI_API_KEY 확인 필요). "
-                   "파일과 답변 레코드는 저장되었으니, 서비스 준비 후 다시 분석을 시도하세요.",
+            detail="STT 서비스가 초기화되지 않았습니다. 파일은 저장되었으니 OPENAI_API_KEY를 확인하세요.",
         )
+
     try:
         answer.stt_text = transcribe_audio(str(audio_path))
         session.add(answer)
@@ -285,13 +298,14 @@ async def submit_answer(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"STT 변환 실패: {exc}") from exc
 
-    # 5. 상세 STT 안정성 분석 — 보조 경로이므로 실패해도 답변 제출 자체는 성공 처리
+    stt_detail = None
+    stt_features = None
     if analysis_consent:
         try:
-            detail = transcribe_audio_detailed(str(audio_path))
-            features = analyze_stt_stability(detail)
-            event_count = _replace_stt_timeline_events(session, answer.answer_id, features)
-            stt_stability = _build_stt_stability_payload(features)
+            stt_detail = transcribe_audio_detailed(str(audio_path))
+            stt_features = analyze_stt_stability(stt_detail)
+            event_count = _replace_stt_timeline_events(session, answer.answer_id, stt_features)
+            stt_stability = _build_stt_stability_payload(stt_features)
             stt_stability["timeline_event_count"] = event_count
         except Exception as exc:  # noqa: BLE001
             stt_stability = {
@@ -305,11 +319,54 @@ async def submit_answer(
             "reason": "AI 분석 동의(ANALYSIS)가 없어 상세 말하기 습관 분석을 실행하지 않았습니다.",
         }
 
-    # 6. (가능하면) AI 답변 분석까지 이어서 수행
+    # 실제 영상/음성 기반 전달 분석. 캘리브레이션 웹 연결 전이므로 calibration=None.
+    # 이 경우 delivery_profile이 시선/자세를 자동으로 score_eligible=False 처리합니다.
+    if analysis_consent and video_path_str:
+        delivery_analysis = analyze_answer_delivery(
+            video_path=video_path_str,
+            audio_path=str(audio_path),
+            stt_text=answer.stt_text or "",
+            stt_detail=stt_detail,
+            stt_features=stt_features,
+            duration_sec=duration_sec,
+            calibration=None,
+        )
+        delivery_event_count = _replace_delivery_timeline_events(
+            session, answer.answer_id, delivery_analysis.get("events") or []
+        )
+        delivery_analysis["timeline_event_count"] = delivery_event_count
+        # 내부 호환값은 API 응답에서 제외하고, score-ready profile만 프론트에 전달합니다.
+        delivery_analysis.pop("legacy_metrics", None)
+        delivery_analysis.pop("events", None)
+    elif not analysis_consent:
+        delivery_analysis = {
+            "status": "not_run",
+            "reason": "AI 분석 동의(ANALYSIS)가 없어 전달 분석을 실행하지 않았습니다.",
+            "delivery_profile": None,
+        }
+    else:
+        delivery_analysis = {
+            "status": "unavailable",
+            "reason": "답변 영상이 없어 비언어 전달 분석을 실행하지 않았습니다.",
+            "delivery_profile": None,
+        }
+
+    delivery_profile = delivery_analysis.get("delivery_profile") or {}
+    measurement = delivery_profile.get("measurement") or {}
+    analysis_allowed_by_audio = measurement.get("language_analysis_allowed") is not False
+
     analysis_id = None
     analysis_note = None
+    analysis_retry_allowed = bool(analysis_consent and analysis_allowed_by_audio)
+
     if not analysis_consent:
-        analysis_note = "AI 분석 동의(ANALYSIS)가 없어 분석은 건너뜁니다. STT까지의 결과는 정상 저장됨."
+        analysis_note = "AI 분석 동의(ANALYSIS)가 없어 내용평가를 건너뜁니다."
+        analysis_retry_allowed = False
+    elif not analysis_allowed_by_audio:
+        issue_codes = measurement.get("audio_issue_codes") or []
+        issue_text = ", ".join(issue_codes) if issue_codes else "오디오 품질 문제"
+        analysis_note = f"{issue_text}로 측정이 어려워 내용평가를 실행하지 않았습니다. 답변을 다시 녹화해주세요."
+        analysis_retry_allowed = False
     elif ai_is_ready():
         try:
             ai_service = get_ai_service()
@@ -335,22 +392,21 @@ async def submit_answer(
             session.refresh(analysis)
             analysis_id = analysis.analysis_id
         except Exception as exc:  # noqa: BLE001
-            analysis_note = f"분석은 실패했지만 답변/STT는 정상 저장됨: {exc}"
+            analysis_note = f"내용 분석은 실패했지만 답변/STT는 정상 저장됨: {exc}"
     else:
-        analysis_note = "AI 서비스 미준비 상태 — 나중에 /ai/user-answers/{answer_id}/analyze를 직접 호출하세요."
+        analysis_note = "AI 서비스 미준비 상태 — 서비스 준비 후 내용평가를 다시 시도할 수 있습니다."
 
     return {
         "answer_id": answer.answer_id,
         "stt_text": answer.stt_text,
         "analysis_id": analysis_id,
         "note": analysis_note,
+        "analysis_retry_allowed": analysis_retry_allowed,
         "stt_stability": stt_stability,
+        "delivery_analysis": delivery_analysis,
     }
 
 
-# ------------------------------------------------------------------
-# 저장된 답변 영상/음성 재생
-# ------------------------------------------------------------------
 @router.get("/user-answers/{answer_id}/video")
 def get_answer_video(answer_id: int, session: Session = Depends(get_session)):
     answer = session.get(UserAnswers, answer_id)
