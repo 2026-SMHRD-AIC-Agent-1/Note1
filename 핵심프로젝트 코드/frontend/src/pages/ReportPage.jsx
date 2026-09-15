@@ -37,13 +37,16 @@ const EVENT_LABELS = {
   SPEECH_HESITATION: "머뭇거림 표현",
   SPEECH_REPETITION: "반복 표현",
   GAZE_AWAY: "시선 이탈",
+  FACE_TURNED: "고개 방향 이탈",
+  BODY_MOVEMENT: "자세 이탈",
   LONG_PAUSE: "긴 침묵",
-  HEAD_NOD: "고개 움직임",
+  LONG_BLINK: "긴 눈감음",
+  NOD: "고개 끄덕임",
+  SHAKE: "고개 젓기",
+  HAND_GESTURE: "손 제스처",
   SMILE: "미소",
 };
 
-// 아직 캘리브레이션 기반 새 비언어 파이프라인이 서비스에 연결되기 전의
-// 기존 DB 필드입니다. 최종 점수용으로 단정하지 않고 참고값으로만 보여줍니다.
 const NONVERBAL_CORE = [
   ["gaze_center_ratio", "시선 중앙 비율 (기존 참고값)"],
   ["speaking_speed", "발화 속도 (기존 참고값)"],
@@ -80,6 +83,11 @@ function formatExpressionCounts(counts) {
   const entries = Object.entries(counts || {});
   if (!entries.length) return "없음";
   return entries.map(([expression, count]) => `${expression} ${count}회`).join(", ");
+}
+
+function formatValue(value, digits = 1) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+  return Number(value).toFixed(digits);
 }
 
 function SectionHead({ num, icon: Icon, title }) {
@@ -150,6 +158,85 @@ function SpeechHabitsSummary({ answer, compact = false }) {
   );
 }
 
+function DeliveryMeasurements({ answer }) {
+  const delivery = answer?.delivery_analysis;
+  if (!delivery) return null;
+
+  const profile = delivery.delivery_profile;
+  const audioQuality = delivery.audio_quality;
+
+  if (!profile) {
+    return (
+      <div className="notice notice-info" style={{ fontSize: 12.5 }}>
+        <strong>전달 분석:</strong> {delivery.reason || "분석 결과가 없습니다."}
+        {audioQuality?.is_valid === false && " 오디오 품질 문제는 감지되었습니다."}
+      </div>
+    );
+  }
+
+  const measurement = profile.measurement || {};
+  const components = profile.components || {};
+  const flow = components.speaking_flow || {};
+  const pace = components.pace_stability || {};
+  const volume = components.volume_stability || {};
+  const gaze = components.gaze_stability || {};
+  const posture = components.posture_stability || {};
+
+  const pauseRatio = flow.pause_ratio != null ? `${formatValue(flow.pause_ratio * 100)}%` : "—";
+  const articulation = pace.articulation_rate_units_per_min;
+  const timedRate = pace.timed_span_hangul_syllables_per_min;
+  const paceText = articulation != null
+    ? `${formatValue(articulation)} 음절/분 (실제 말한 구간 기준)`
+    : timedRate != null
+      ? `${formatValue(timedRate)} 음절/분 (첫 단어~마지막 단어 기준)`
+      : "—";
+
+  return (
+    <table className="compare" style={{ marginTop: 8 }}>
+      <tbody>
+        <tr>
+          <td style={{ fontWeight: 700, textAlign: "left" }}>오디오 측정</td>
+          <td style={{ textAlign: "left" }}>
+            {measurement.audio_status === "available" ? "측정 가능" : "측정 불가"}
+          </td>
+        </tr>
+        <tr>
+          <td style={{ fontWeight: 700, textAlign: "left" }}>말하기 흐름</td>
+          <td style={{ textAlign: "left" }}>
+            침묵 비율 {pauseRatio} · 가장 긴 침묵 {formatValue(flow.max_pause_sec)}초
+          </td>
+        </tr>
+        <tr>
+          <td style={{ fontWeight: 700, textAlign: "left" }}>발화 속도 참고값</td>
+          <td style={{ textAlign: "left" }}>{paceText}</td>
+        </tr>
+        <tr>
+          <td style={{ fontWeight: 700, textAlign: "left" }}>음량 변화폭</td>
+          <td style={{ textAlign: "left" }}>
+            {volume.volume_variation_db != null ? `${formatValue(volume.volume_variation_db, 2)} dB` : "—"}
+          </td>
+        </tr>
+        <tr>
+          <td style={{ fontWeight: 700, textAlign: "left" }}>시선 안정성</td>
+          <td style={{ textAlign: "left" }}>
+            {gaze.score_eligible
+              ? `점수 후보 · 이탈 ${formatValue(gaze.deviation_per_min)}회/분 · 시간비율 ${formatValue((gaze.deviation_time_ratio || 0) * 100)}%`
+              : "캘리브레이션 연결 전 — 점수에 사용하지 않음"}
+          </td>
+        </tr>
+        <tr>
+          <td style={{ fontWeight: 700, textAlign: "left" }}>자세 안정성</td>
+          <td style={{ textAlign: "left" }}>
+            {posture.score_eligible
+              ? `점수 후보 · 고개 이탈 ${formatValue(posture.face_deviation_per_min)}회/분 · 상체 이탈 ${formatValue(posture.body_movement_per_min)}회/분`
+              : "캘리브레이션 연결 전 — 점수에 사용하지 않음"}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  );
+}
+
 export default function ReportPage({ user, session, questions, answers, coaching, onStartNextRound }) {
   const [nonverbalMetrics, setNonverbalMetrics] = useState([]);
   const [comparison, setComparison] = useState(null);
@@ -163,8 +250,6 @@ export default function ReportPage({ user, session, questions, answers, coaching
     .map((q) => ({ q, a: answers[q.question_id] }))
     .filter((item) => item.a);
 
-  // 현재 coaching.overall_score는 직무 내용 점수와 답변 구성 점수를 바탕으로 한
-  // '내용 종합 점수'입니다. 전달 안정성 점수는 아직 합산하지 않습니다.
   const jobScores = answeredList
     .map((item) => item.a.analysis?.job_score)
     .filter((s) => s !== null && s !== undefined);
@@ -280,13 +365,9 @@ export default function ReportPage({ user, session, questions, answers, coaching
             <p className="blockquote-blue">{coaching.content_summary}</p>
             <hr className="rule" />
             <div className="panel-title">전달 종합 코칭</div>
-            {featuredMetric ? (
-              <p className="blockquote-green">{coaching.delivery_summary}</p>
-            ) : (
-              <p className="blockquote-green">
-                캘리브레이션 기반 비언어 분석 파이프라인 연결 후 제공됩니다. 현재는 말하기 습관을 아래 리포트에서 참고용으로 확인할 수 있습니다.
-              </p>
-            )}
+            <p className="blockquote-green">
+              현재 실제 전달 측정값은 아래 ‘전달 분석 요약’에 표시합니다. 최종 전달 점수와 종합 코칭 문구는 캘리브레이션 통합과 점수 기준 확정 후 제공합니다.
+            </p>
 
             {strengths.length > 0 && (
               <>
@@ -361,15 +442,11 @@ export default function ReportPage({ user, session, questions, answers, coaching
                   ))}
                 </div>
               ) : (
-                events && (
-                  <p style={{ fontSize: 13, color: "var(--muted-onDark)" }}>
-                    이 답변에 기록된 타임스탬프 이벤트가 없습니다.
-                  </p>
-                )
+                events && <p style={{ fontSize: 13 }}>이 답변에 기록된 타임스탬프 이벤트가 없습니다.</p>
               )}
             </>
           ) : (
-            <p style={{ color: "var(--muted-onDark)" }}>아직 재생할 답변 영상이 없습니다.</p>
+            <p>아직 재생할 답변 영상이 없습니다.</p>
           )}
 
           <SectionHead num={5} icon={GitCompare} title="2회차부터 이전 연습과 비교" />
@@ -423,9 +500,7 @@ export default function ReportPage({ user, session, questions, answers, coaching
                     <>
                       <p style={{ marginBottom: 4 }}><strong>핵심 평가 포인트</strong></p>
                       <ul className="q-points">
-                        {q.evaluation_points.map((p, idx) => (
-                          <li key={idx}>{p}</li>
-                        ))}
+                        {q.evaluation_points.map((p, idx) => <li key={idx}>{p}</li>)}
                       </ul>
                     </>
                   )}
@@ -477,6 +552,21 @@ export default function ReportPage({ user, session, questions, answers, coaching
           </details>
 
           <SectionHead num={8} icon={Activity} title="전달 분석 요약" />
+
+          <div className="panel">
+            <div className="panel-title">실제 영상·음성 측정값 · 최종 점수 전 단계</div>
+            {answeredList.some((item) => item.a.delivery_analysis) ? (
+              answeredList.map((item, idx) => (
+                <div key={item.q.question_id} style={{ marginBottom: idx === answeredList.length - 1 ? 0 : 18 }}>
+                  <strong>Q{idx + 1}</strong>
+                  <DeliveryMeasurements answer={item.a} />
+                </div>
+              ))
+            ) : (
+              <p>전달 분석 결과가 아직 없습니다.</p>
+            )}
+          </div>
+
           <div className="panel">
             <div className="panel-title">말하기 습관 · 점수 미반영</div>
             {answeredList.some((item) => item.a.stt_stability) ? (
@@ -491,31 +581,24 @@ export default function ReportPage({ user, session, questions, answers, coaching
             )}
           </div>
 
-          <div className="panel">
-            <div className="panel-title">시선·자세·음성 안정성</div>
-            {featuredMetric ? (
-              <>
-                <p style={{ fontSize: 12.5 }}>
-                  아래 값은 기존 NONVERBAL_METRICS 호환값입니다. 캘리브레이션 기반 새 점수 기준이 연결되기 전까지 최종 평가 점수로 사용하지 않습니다.
-                </p>
-                <table className="compare">
-                  <tbody>
-                    {NONVERBAL_CORE.map(([key, label]) => (
-                      <tr key={key}>
-                        <td style={{ fontWeight: 700, textAlign: "left" }}>{label}</td>
-                        <td style={{ textAlign: "left" }}>{featuredMetric[key] ?? "—"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </>
-            ) : (
-              <p>
-                캘리브레이션 기반 비언어 분석 파이프라인이 아직 실제 답변 제출 흐름에 연결되지 않았습니다.
-                연결 전에는 시선·자세 점수를 만들지 않습니다.
+          {featuredMetric && (
+            <div className="panel">
+              <div className="panel-title">기존 DB 비언어 호환값</div>
+              <p style={{ fontSize: 12.5 }}>
+                아래 값은 과거 NONVERBAL_METRICS 구조와의 호환을 위한 참고값입니다. 최종 전달 안정성 점수에는 아직 사용하지 않습니다.
               </p>
-            )}
-          </div>
+              <table className="compare">
+                <tbody>
+                  {NONVERBAL_CORE.map(([key, label]) => (
+                    <tr key={key}>
+                      <td style={{ fontWeight: 700, textAlign: "left" }}>{label}</td>
+                      <td style={{ textAlign: "left" }}>{featuredMetric[key] ?? "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
 
           {featuredMetric && (
             <details className="qdetail-row">
@@ -534,7 +617,7 @@ export default function ReportPage({ user, session, questions, answers, coaching
 
           <div className="footer-note">
             머뭇거림 표현과 반복 표현은 코칭 리포트 전용이며 점수에 반영하지 않습니다.
-            시선·자세 점수는 캘리브레이션을 통과한 측정값만 사용하도록 연결할 예정입니다.
+            시선·자세는 캘리브레이션을 통과한 측정값만 점수 후보로 사용합니다.
           </div>
         </div>
       </div>
