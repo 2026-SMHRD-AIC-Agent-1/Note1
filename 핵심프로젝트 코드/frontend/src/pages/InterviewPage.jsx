@@ -8,7 +8,7 @@ const SPEECH_SUPPORTED = typeof window !== "undefined" && "speechSynthesis" in w
 export default function InterviewPage({ user, session, questions, onFinish }) {
   const [index, setIndex] = useState(0);
   const [recorded, setRecorded] = useState(null); // { audioBlob, videoBlob }
-  const [answers, setAnswers] = useState({}); // question_id -> { answer_id, stt_text, analysis, note }
+  const [answers, setAnswers] = useState({}); // question_id -> { answer_id, stt_text, analysis, stt_stability, note }
   const [submitting, setSubmitting] = useState(false);
   const [finishing, setFinishing] = useState(false);
   const [error, setError] = useState(null);
@@ -55,9 +55,8 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
         videoBlob: recorded.videoBlob,
         durationSec: recorded.durationSec,
       });
-      // uploads.py는 이제 {answer_id, stt_text, analysis_id, note}만 돌려줍니다
-      // (분석 전체 내용은 따로 조회해야 함). analysis_id가 없으면(예: 업로드 시점에
-      // AI가 아직 준비 안 됐던 경우) 여기서 한 번 더 분석을 시도합니다.
+      // uploads.py 응답에는 기본 STT/내용분석 식별자와 함께 상세 STT 안정성 결과가 들어옵니다.
+      // 상세 STT가 실패해도 기본 STT와 내용평가는 그대로 사용할 수 있습니다.
       let analysis = null;
       let note = result.note;
       if (result.analysis_id) {
@@ -77,6 +76,7 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
           answer_id: result.answer_id,
           stt_text: result.stt_text,
           analysis,
+          stt_stability: result.stt_stability || null,
           note,
         },
       }));
