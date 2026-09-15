@@ -11,6 +11,7 @@
 6. 타임라인 이벤트 중 정책상 안전한 이벤트만 Backend에 넘김
 
 캘리브레이션 웹 연결 전에는 시선/자세 이벤트를 사용자 리포트에 저장하지 않습니다.
+통합 규격은 integration_contract_v1.py를 기준으로 합니다.
 """
 from __future__ import annotations
 
@@ -20,6 +21,12 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+from integration_contract_v1 import (
+    LEGACY_EXCLUDED_EVENT_TYPES,
+    UNCALIBRATED_ALLOWED_DELIVERY_EVENT_TYPES,
+    normalize_delivery_profile,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -31,8 +38,6 @@ _DERIVE_FEATURES = None
 _BUILD_PROFILE = None
 _CHECK_AUDIO_QUALITY = None
 _INIT_ERROR: str | None = None
-
-AUDIO_EVENT_TYPES = {"LONG_PAUSE"}
 
 
 def _load_modules() -> None:
@@ -133,9 +138,9 @@ def _filter_events(raw: dict) -> list[dict[str, Any]]:
         if not isinstance(event, dict):
             continue
         event_type = event.get("event_type")
-        if event_type == "FILLER_WORD":
+        if event_type in LEGACY_EXCLUDED_EVENT_TYPES:
             continue
-        if calibration_used or event_type in AUDIO_EVENT_TYPES:
+        if calibration_used or event_type in UNCALIBRATED_ALLOWED_DELIVERY_EVENT_TYPES:
             out.append(event)
     return out
 
@@ -150,7 +155,7 @@ def analyze_answer_delivery(
     duration_sec: int | float | None,
     calibration=None,
 ) -> dict:
-    """한 답변을 분석해 최종 점수 전 단계의 전달 profile을 반환합니다."""
+    """한 답변을 분석해 최종 점수 전 단계의 canonical delivery_profile을 반환합니다."""
     _load_modules()
     if _ANALYZER is None:
         return {
@@ -187,7 +192,9 @@ def analyze_answer_delivery(
             raw["audio_quality"] = audio_quality
 
         features = _DERIVE_FEATURES(raw, duration_sec=duration_sec)
-        delivery_profile = _BUILD_PROFILE(raw, features, stt_features or {})
+        delivery_profile = normalize_delivery_profile(
+            _BUILD_PROFILE(raw, features, stt_features or {})
+        )
 
         legacy_metrics = _MAP_TO_DB(raw)
         legacy_metrics["filler_word_count"] = None
