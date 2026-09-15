@@ -1,38 +1,79 @@
 import { useEffect, useState } from "react";
-import { Volume2, HelpCircle, CheckCircle2, Send, FileText, RotateCcw, AlertTriangle } from "lucide-react";
+import {
+  Volume2,
+  HelpCircle,
+  CheckCircle2,
+  Send,
+  FileText,
+  RotateCcw,
+  AlertTriangle,
+  MessageCircleMore,
+} from "lucide-react";
 import Recorder from "../components/Recorder.jsx";
-import { submitAnswer, analyzeAnswer, listAnswerAnalyses, generateCoaching, ApiError } from "../api.js";
+import {
+  submitAnswer,
+  analyzeAnswer,
+  listAnswerAnalyses,
+  generateCoaching,
+  generateDeepFollowup,
+  ApiError,
+} from "../api.js";
 
 const SPEECH_SUPPORTED = typeof window !== "undefined" && "speechSynthesis" in window;
+const DEEP_MAX_FOLLOWUPS = 3;
 
 export default function InterviewPage({ user, session, questions, onFinish }) {
+  const [interviewQuestions, setInterviewQuestions] = useState(questions);
   const [index, setIndex] = useState(0);
   const [recorded, setRecorded] = useState(null);
   const [answers, setAnswers] = useState({});
   const [submitting, setSubmitting] = useState(false);
   const [finishing, setFinishing] = useState(false);
+  const [generatingFollowup, setGeneratingFollowup] = useState(false);
   const [error, setError] = useState(null);
   const [recorderKey, setRecorderKey] = useState(0);
   const [speaking, setSpeaking] = useState(false);
 
-  const question = questions[index];
-  const isLast = index === questions.length - 1;
-  const currentAnswer = answers[question.question_id];
+  const question = interviewQuestions[index];
+  const isDeep = session.interview_type === "DEEP_INTERVIEW";
+  const isLast = index === interviewQuestions.length - 1;
+  const deepFollowupCount = isDeep ? Math.max(0, interviewQuestions.length - 1) : 0;
+  const canGenerateDeepFollowup = isDeep && isLast && deepFollowupCount < DEEP_MAX_FOLLOWUPS;
+  const currentAnswer = question ? answers[question.question_id] : null;
   const alreadyAnswered = Boolean(currentAnswer);
   const needsRetake = Boolean(
     currentAnswer?.delivery_analysis?.delivery_profile?.measurement?.retake_recommended
   );
 
+  // 새 세션으로 바뀌면 심층면접에서 동적으로 추가했던 질문/답변 상태도 초기화합니다.
   useEffect(() => {
+    setInterviewQuestions(questions);
+    setIndex(0);
+    setAnswers({});
+    setRecorded(null);
+    setError(null);
+    setRecorderKey((k) => k + 1);
+  }, [session.session_id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!question) return;
     if (SPEECH_SUPPORTED) window.speechSynthesis.cancel();
     setSpeaking(false);
-  }, [question.question_id]);
+  }, [question?.question_id]);
 
   useEffect(() => {
     return () => {
       if (SPEECH_SUPPORTED) window.speechSynthesis.cancel();
     };
   }, []);
+
+  if (!question) {
+    return (
+      <div className="main" style={{ maxWidth: 900 }}>
+        <div className="notice notice-error">면접 질문을 불러오지 못했습니다.</div>
+      </div>
+    );
+  }
 
   function handleSpeakQuestion() {
     if (!SPEECH_SUPPORTED) return;
@@ -120,12 +161,37 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
     setIndex((i) => i + 1);
   }
 
+  async function handleDeepFollowup() {
+    if (!canGenerateDeepFollowup) return;
+    setGeneratingFollowup(true);
+    setError(null);
+    try {
+      const nextQuestion = await generateDeepFollowup(
+        session.session_id,
+        question.question_id
+      );
+      const nextIndex = interviewQuestions.length;
+      setInterviewQuestions((prev) => [...prev, nextQuestion]);
+      setRecorded(null);
+      setRecorderKey((k) => k + 1);
+      setIndex(nextIndex);
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setError(err.detail || err.message || "꼬리질문 생성에 실패했습니다.");
+      } else {
+        setError(err.message || "꼬리질문 생성에 실패했습니다.");
+      }
+    } finally {
+      setGeneratingFollowup(false);
+    }
+  }
+
   async function handleFinish() {
     setFinishing(true);
     setError(null);
     try {
       const coaching = await generateCoaching(session.session_id);
-      onFinish({ questions, answers, coaching });
+      onFinish({ questions: interviewQuestions, answers, coaching });
     } catch (err) {
       if (err instanceof ApiError && err.status === 400) {
         setError(`아직 모든 질문의 답변·분석이 끝나지 않았습니다: ${err.detail}`);
@@ -136,6 +202,12 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
       setFinishing(false);
     }
   }
+
+  const questionProgressLabel = isDeep
+    ? index === 0
+      ? `첫 질문 · 최대 ${DEEP_MAX_FOLLOWUPS}회 꼬리질문`
+      : `꼬리질문 ${index} / ${DEEP_MAX_FOLLOWUPS}`
+    : `질문 ${index + 1} / ${interviewQuestions.length}`;
 
   return (
     <div className="main" style={{ maxWidth: 900, paddingTop: 24, paddingBottom: 24 }}>
@@ -148,7 +220,7 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
             style={{ marginBottom: 10, display: "inline-flex", alignItems: "center", gap: 6 }}
           >
             <HelpCircle size={13} />
-            질문 {index + 1} / {questions.length}
+            {questionProgressLabel}
             {question.question_type ? ` · ${question.question_type}` : ""}
           </div>
           <h3 className="q-text" style={{ fontSize: 16 }}>{question.question_text}</h3>
@@ -184,7 +256,7 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
 
           {question.practice_reason && (
             <div className="notice notice-info" style={{ marginTop: 10, fontSize: 12.5, padding: "8px 12px" }}>
-              이전 회차 코칭 반영: {question.practice_reason}
+              {isDeep ? "꼬리질문 이유" : "이전 회차 코칭 반영"}: {question.practice_reason}
             </div>
           )}
         </div>
@@ -243,6 +315,16 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
                     <RotateCcw size={15} /> 이 질문 다시 녹화하기
                   </button>
                 </>
+              ) : canGenerateDeepFollowup ? (
+                <button
+                  className="btn btn-primary btn-block"
+                  onClick={handleDeepFollowup}
+                  disabled={generatingFollowup}
+                >
+                  {generatingFollowup && <span className="spinner" />}
+                  <MessageCircleMore size={15} />
+                  답변을 바탕으로 꼬리질문 받기 ({deepFollowupCount + 1}/{DEEP_MAX_FOLLOWUPS})
+                </button>
               ) : !isLast ? (
                 <button className="btn btn-primary btn-block" onClick={handleNext}>
                   다음 질문으로
