@@ -26,7 +26,11 @@ engine = create_engine(
 
 
 def init_db() -> None:
-    """models.py에 정의된 모든 테이블을 생성합니다. (CREATE TABLE 자동 실행)"""
+    """models.py + integration_models.py에 정의된 모든 테이블을 생성합니다."""
+    # SQLModel.metadata에 통합 규격 V1 신규 테이블도 등록되도록 반드시 import 합니다.
+    import models  # noqa: F401
+    import integration_models  # noqa: F401
+
     SQLModel.metadata.create_all(engine)
 
 
