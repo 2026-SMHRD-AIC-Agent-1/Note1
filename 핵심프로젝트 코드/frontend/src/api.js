@@ -104,6 +104,15 @@ export function generateCoaching(sessionId) {
   return postJson(`/ai/sessions/${sessionId}/generate-coaching`, {});
 }
 
+// 심층면접: 같은 세션 안에서 직전 답변을 보고 꼬리질문을 1개 생성합니다.
+// 백엔드가 최대 3회 제한과 "가장 최근 질문에서만 생성" 규칙을 관리합니다.
+export function generateDeepFollowup(sessionId, questionId) {
+  return postJson(
+    `/ai/sessions/${sessionId}/generate-deep-followup?question_id=${questionId}`,
+    {}
+  );
+}
+
 // 저장된 답변을 (다시) 분석합니다. uploads.py의 /user-answers/submit이 업로드 시점에
 // 자동으로 분석까지 시도하지만, 그때 AI가 준비 안 돼 있었을 경우 이 엔드포인트로
 // 나중에 다시 시도할 수 있습니다.
@@ -111,9 +120,8 @@ export function analyzeAnswer(answerId) {
   return postJson(`/ai/user-answers/${answerId}/analyze`, {});
 }
 
-// 1회차 코칭(우선 개선점·다음 목표)을 반영한 꼬리질문을 생성합니다.
-// nextSessionId는 미리 POST /interview-sessions(previous_session_id 포함)로
-// 만들어둔 "다음 회차" 세션이어야 합니다.
+// 1회차 코칭(우선 개선점·다음 목표)을 반영한 "다음 회차" 연습 질문 생성.
+// 같은 심층면접 세션 안의 꼬리질문(generateDeepFollowup)과는 다른 기능입니다.
 export function generateFollowupQuestion(nextSessionId, previousSessionId) {
   return postJson(
     `/ai/sessions/${nextSessionId}/generate-followup-question?previous_session_id=${previousSessionId}`,
