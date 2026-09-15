@@ -20,7 +20,6 @@ import logging
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-# 환경변수는 라우터 import보다 먼저 로드해야 모듈 초기화 시점 설정이 안전합니다.
 load_dotenv()
 
 from fastapi import FastAPI
@@ -30,7 +29,7 @@ from sqlmodel import Session
 from database import init_db, engine
 from ai_service_client import init_ai_service, is_ready
 from stt_service import init_stt_service, is_ready as stt_is_ready
-from path_config import resolve_project_path
+from nonverbal_service import is_ready as nonverbal_is_ready, init_error as nonverbal_init_error
 from routers import (
     users, companies, jobs, rag_documents,
     interview_sessions, interview_questions, user_answers,
@@ -44,12 +43,10 @@ logger = logging.getLogger("main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()  # 앱 시작 시 테이블이 없으면 자동 생성
-    init_ai_service()  # RAG·언어 AI 서비스 1회 초기화 (실패해도 서버는 계속 뜸, /ai/* 만 비활성화)
-    init_stt_service()  # STT 서비스 1회 초기화 (실패해도 서버는 계속 뜸, STT 관련 엔드포인트만 비활성화)
+    init_db()
+    init_ai_service()
+    init_stt_service()
 
-    # RAG_DATA_DIR의 파일들을 RAG_DOCUMENTS 테이블에 동기화 (RAG -> DB 연결).
-    # 실패해도(폴더 없음 등) 서버 자체는 정상적으로 뜨게 예외를 잡아둡니다.
     try:
         with Session(engine) as session:
             result = rag_documents.sync_rag_documents_from_files(session)
@@ -62,9 +59,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI 모의면접 코칭 Agent API", lifespan=lifespan)
 
-# ------------------------------------------------------------------
-# CORS: .env의 CORS_ORIGINS 값을 읽어서 Frontend 호출을 허용합니다.
-# ------------------------------------------------------------------
 cors_origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if x.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -74,9 +68,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------------------
-# 테이블별 라우터 연결 (10개 확정 테이블)
-# ------------------------------------------------------------------
 app.include_router(users.router)
 app.include_router(companies.router)
 app.include_router(jobs.router)
@@ -97,5 +88,12 @@ app.include_router(consents.router)
 
 @app.get("/health")
 def health_check():
-    """서버가 살아있는지 확인용 (Docker에서도 활용)"""
-    return {"status": "ok", "ai_service_ready": is_ready(), "stt_service_ready": stt_is_ready()}
+    """로컬 데모에서 세 핵심 AI 경로의 준비 상태를 한 번에 확인합니다."""
+    nonverbal_ready = nonverbal_is_ready()
+    return {
+        "status": "ok",
+        "ai_service_ready": is_ready(),
+        "stt_service_ready": stt_is_ready(),
+        "nonverbal_service_ready": nonverbal_ready,
+        "nonverbal_service_error": None if nonverbal_ready else nonverbal_init_error(),
+    }
