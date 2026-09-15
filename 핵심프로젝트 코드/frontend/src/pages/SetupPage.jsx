@@ -9,11 +9,10 @@ import {
 } from "../api.js";
 
 // rag_ai/rag_ai_service.py의 INTERVIEW_TYPES = ('AISK', 'DEEP_INTERVIEW')와
-// 정확히 일치해야 합니다. 다른 문자열(예전의 "직무면접"/"인성면접")을 보내면
-// generate-questions 호출이 500 에러로 실패합니다.
+// 정확히 일치해야 합니다.
 const INTERVIEW_TYPES = [
   { value: "AISK", label: "A!SK 영상면접 (직무이해·문제해결·협업 3문항)" },
-  { value: "DEEP_INTERVIEW", label: "심층면접 (1문항, 꼬리질문형 · 준비중)" },
+  { value: "DEEP_INTERVIEW", label: "심층면접 (첫 질문 + 답변 기반 꼬리질문 최대 3회)" },
 ];
 
 export default function SetupPage({ user, onReady }) {
