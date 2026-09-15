@@ -7,7 +7,8 @@
 2. score-ready `stability_features`와 `delivery_profile_v1` 생성
 3. 캘리브레이션이 없으면 시선/자세는 자동으로 score_eligible=False 유지
 4. 오디오 품질이 나쁘면 measurement_unavailable로 표시
-5. 타임라인 이벤트 중 정책상 안전한 이벤트만 Backend에 넘김
+5. 얼굴/영상 분석이 실패해도 오디오 품질 검사는 가능한 한 별도로 살림
+6. 타임라인 이벤트 중 정책상 안전한 이벤트만 Backend에 넘김
 
 캘리브레이션 웹 연결 전에는 시선/자세 이벤트를 사용자 리포트에 저장하지 않습니다.
 """
@@ -28,24 +29,28 @@ _ANALYZER = None
 _MAP_TO_DB = None
 _DERIVE_FEATURES = None
 _BUILD_PROFILE = None
+_CHECK_AUDIO_QUALITY = None
 _INIT_ERROR: str | None = None
 
-# 캘리브레이션 없이도 의미 있게 볼 수 있는 실제 음성 신호 기반 이벤트.
-# 시선/자세는 캘리브레이션 연결 전에는 저장하지 않습니다.
 AUDIO_EVENT_TYPES = {"LONG_PAUSE"}
 
 
 def _load_modules() -> None:
-    global _ANALYZER, _MAP_TO_DB, _DERIVE_FEATURES, _BUILD_PROFILE, _INIT_ERROR
+    global _ANALYZER, _MAP_TO_DB, _DERIVE_FEATURES, _BUILD_PROFILE, _CHECK_AUDIO_QUALITY, _INIT_ERROR
     if _ANALYZER is not None or _INIT_ERROR is not None:
         return
     try:
-        from nonverbal_ai.nonverbal_analysis_v3 import analyze_video, map_to_db_fields
+        from nonverbal_ai.nonverbal_analysis_v3 import (
+            analyze_video,
+            map_to_db_fields,
+            check_audio_quality_from_file,
+        )
         from nonverbal_ai.stability_features import derive_stability_features
         from nonverbal_ai.delivery_stability_v1 import build_delivery_profile
 
         _ANALYZER = analyze_video
         _MAP_TO_DB = map_to_db_fields
+        _CHECK_AUDIO_QUALITY = check_audio_quality_from_file
         _DERIVE_FEATURES = derive_stability_features
         _BUILD_PROFILE = build_delivery_profile
     except Exception as exc:  # noqa: BLE001
@@ -111,6 +116,15 @@ def _to_wav_if_possible(audio_path: str) -> tuple[str, str | None]:
         return audio_path, None
 
 
+def _safe_audio_quality(audio_path: str) -> dict | None:
+    if _CHECK_AUDIO_QUALITY is None:
+        return None
+    try:
+        return _CHECK_AUDIO_QUALITY(audio_path)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _filter_events(raw: dict) -> list[dict[str, Any]]:
     events = raw.get("events") or []
     calibration_used = bool(raw.get("calibration_used", False))
@@ -119,8 +133,6 @@ def _filter_events(raw: dict) -> list[dict[str, Any]]:
         if not isinstance(event, dict):
             continue
         event_type = event.get("event_type")
-        # 기존 FILLER_WORD는 상세 STT의 '머뭇거림 표현' 이벤트와 중복되고
-        # 문맥 오탐 가능성이 있어 저장하지 않습니다.
         if event_type == "FILLER_WORD":
             continue
         if calibration_used or event_type in AUDIO_EVENT_TYPES:
@@ -138,29 +150,31 @@ def analyze_answer_delivery(
     duration_sec: int | float | None,
     calibration=None,
 ) -> dict:
-    """한 답변을 분석해 최종 점수 전 단계의 전달 profile을 반환합니다.
-
-    `calibration=None`이면 시선/자세는 측정 참고값만 남고 점수 후보가 되지 않습니다.
-    웹 캘리브레이션이 연결되면 같은 함수의 calibration 인자만 채우면 됩니다.
-    """
-    if not video_path:
-        return {
-            "status": "unavailable",
-            "reason": "답변 영상이 없어 비언어 분석을 실행하지 않았습니다.",
-            "delivery_profile": None,
-            "events": [],
-        }
-
+    """한 답변을 분석해 최종 점수 전 단계의 전달 profile을 반환합니다."""
     _load_modules()
     if _ANALYZER is None:
         return {
             "status": "unavailable",
             "reason": _INIT_ERROR or "비언어 AI가 준비되지 않았습니다.",
             "delivery_profile": None,
+            "audio_quality": None,
             "events": [],
         }
 
     analysis_audio_path, tmp_wav = _to_wav_if_possible(audio_path)
+    audio_quality = _safe_audio_quality(analysis_audio_path)
+
+    if not video_path:
+        if tmp_wav:
+            Path(tmp_wav).unlink(missing_ok=True)
+        return {
+            "status": "unavailable",
+            "reason": "답변 영상이 없어 시선·자세 비언어 분석을 실행하지 않았습니다.",
+            "delivery_profile": None,
+            "audio_quality": audio_quality,
+            "events": [],
+        }
+
     try:
         raw = _ANALYZER(
             video_path,
@@ -169,11 +183,12 @@ def analyze_answer_delivery(
             word_timestamps=_word_timestamp_pairs(stt_detail),
             calibration=calibration,
         )
+        if raw.get("audio_quality") is None and audio_quality is not None:
+            raw["audio_quality"] = audio_quality
+
         features = _DERIVE_FEATURES(raw, duration_sec=duration_sec)
         delivery_profile = _BUILD_PROFILE(raw, features, stt_features or {})
 
-        # 기존 DB 14필드와의 호환값은 필요할 때만 참고할 수 있도록 반환합니다.
-        # 머뭇거림 표현은 새 상세 STT가 담당하므로 legacy filler 값은 사용하지 않습니다.
         legacy_metrics = _MAP_TO_DB(raw)
         legacy_metrics["filler_word_count"] = None
 
@@ -183,15 +198,16 @@ def analyze_answer_delivery(
             "delivery_profile": delivery_profile,
             "legacy_metrics": legacy_metrics,
             "events": _filter_events(raw),
-            "audio_quality": raw.get("audio_quality"),
+            "audio_quality": raw.get("audio_quality") or audio_quality,
             "calibration_used": bool(raw.get("calibration_used", False)),
             "calibration_valid": raw.get("calibration_valid"),
         }
     except Exception as exc:  # noqa: BLE001
         return {
             "status": "unavailable",
-            "reason": f"비언어 분석 실패: {exc}",
+            "reason": f"비언어 영상 분석 실패: {exc}",
             "delivery_profile": None,
+            "audio_quality": audio_quality,
             "events": [],
         }
     finally:
