@@ -155,7 +155,7 @@ export default function SetupPage({ user, onReady }) {
               </select>
             </div>
             <div className="notice notice-info" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <Lightbulb size={15} /> 마이크 및 웹캠 사전 점검 완료
+              <Lightbulb size={15} /> 현재 카메라·마이크 권한은 답변 녹화 직전에 확인합니다. 캘리브레이션 화면은 다음 통합 단계에서 연결합니다.
             </div>
           </div>
         </div>
