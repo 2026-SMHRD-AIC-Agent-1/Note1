@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Volume2, HelpCircle, CheckCircle2, Send, FileText } from "lucide-react";
+import { Volume2, HelpCircle, CheckCircle2, Send, FileText, RotateCcw, AlertTriangle } from "lucide-react";
 import Recorder from "../components/Recorder.jsx";
 import { submitAnswer, analyzeAnswer, listAnswerAnalyses, generateCoaching, ApiError } from "../api.js";
 
@@ -7,19 +7,22 @@ const SPEECH_SUPPORTED = typeof window !== "undefined" && "speechSynthesis" in w
 
 export default function InterviewPage({ user, session, questions, onFinish }) {
   const [index, setIndex] = useState(0);
-  const [recorded, setRecorded] = useState(null); // { audioBlob, videoBlob }
-  const [answers, setAnswers] = useState({}); // question_id -> { answer_id, stt_text, analysis, stt_stability, note }
+  const [recorded, setRecorded] = useState(null);
+  const [answers, setAnswers] = useState({});
   const [submitting, setSubmitting] = useState(false);
   const [finishing, setFinishing] = useState(false);
   const [error, setError] = useState(null);
-  const [recorderKey, setRecorderKey] = useState(0); // Recorder 재마운트용
+  const [recorderKey, setRecorderKey] = useState(0);
   const [speaking, setSpeaking] = useState(false);
 
   const question = questions[index];
   const isLast = index === questions.length - 1;
-  const alreadyAnswered = Boolean(answers[question.question_id]);
+  const currentAnswer = answers[question.question_id];
+  const alreadyAnswered = Boolean(currentAnswer);
+  const needsRetake = Boolean(
+    currentAnswer?.delivery_analysis?.delivery_profile?.measurement?.retake_recommended
+  );
 
-  // 질문이 바뀌면 이전 질문을 읽던 음성은 멈춥니다.
   useEffect(() => {
     if (SPEECH_SUPPORTED) window.speechSynthesis.cancel();
     setSpeaking(false);
@@ -55,14 +58,13 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
         videoBlob: recorded.videoBlob,
         durationSec: recorded.durationSec,
       });
-      // uploads.py 응답에는 기본 STT/내용분석 식별자와 함께 상세 STT 안정성 결과가 들어옵니다.
-      // 상세 STT가 실패해도 기본 STT와 내용평가는 그대로 사용할 수 있습니다.
+
       let analysis = null;
       let note = result.note;
       if (result.analysis_id) {
         const all = await listAnswerAnalyses();
         analysis = all.find((a) => a.analysis_id === result.analysis_id) || null;
-      } else {
+      } else if (result.analysis_retry_allowed !== false) {
         try {
           analysis = await analyzeAnswer(result.answer_id);
           note = null;
@@ -70,6 +72,7 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
           note = note || (retryErr instanceof ApiError ? retryErr.detail : retryErr.message);
         }
       }
+
       setAnswers((prev) => ({
         ...prev,
         [question.question_id]: {
@@ -77,6 +80,7 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
           stt_text: result.stt_text,
           analysis,
           stt_stability: result.stt_stability || null,
+          delivery_analysis: result.delivery_analysis || null,
           note,
         },
       }));
@@ -96,6 +100,17 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
     } finally {
       setSubmitting(false);
     }
+  }
+
+  function handleRetake() {
+    setAnswers((prev) => {
+      const next = { ...prev };
+      delete next[question.question_id];
+      return next;
+    });
+    setRecorded(null);
+    setError(null);
+    setRecorderKey((k) => k + 1);
   }
 
   function handleNext() {
@@ -201,24 +216,34 @@ export default function InterviewPage({ user, session, questions, onFinish }) {
               </div>
               <p style={{ fontSize: 13, display: "flex", gap: 6 }}>
                 <FileText size={14} style={{ flexShrink: 0, marginTop: 2 }} />
-                <span><strong>내 답변:</strong> {answers[question.question_id].stt_text}</span>
+                <span><strong>내 답변:</strong> {currentAnswer.stt_text}</span>
               </p>
-              {answers[question.question_id].analysis ? (
+
+              {currentAnswer.analysis ? (
                 <p style={{ fontSize: 13 }}>
-                  <span className="tag">
-                    직무 관점: {answers[question.question_id].analysis.job_evaluation}
-                  </span>
-                  <span className="tag">
-                    답변 구성: {answers[question.question_id].analysis.answer_evaluation}
-                  </span>
+                  <span className="tag">직무 관점: {currentAnswer.analysis.job_evaluation}</span>
+                  <span className="tag">답변 구성: {currentAnswer.analysis.answer_evaluation}</span>
                 </p>
               ) : (
                 <div className="notice notice-info" style={{ fontSize: 12.5 }}>
-                  {answers[question.question_id].note || "이 답변의 분석 결과가 아직 없습니다."}
+                  {currentAnswer.note || "이 답변의 분석 결과가 아직 없습니다."}
                 </div>
               )}
 
-              {!isLast ? (
+              {needsRetake ? (
+                <>
+                  <div className="notice notice-error" style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                    <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+                    <span>
+                      마이크 입력이나 주변 소음 때문에 이 답변을 안정적으로 분석하기 어렵습니다.
+                      점수로 처리하지 않고 다시 녹화하는 것이 좋습니다.
+                    </span>
+                  </div>
+                  <button className="btn btn-primary btn-block" onClick={handleRetake}>
+                    <RotateCcw size={15} /> 이 질문 다시 녹화하기
+                  </button>
+                </>
+              ) : !isLast ? (
                 <button className="btn btn-primary btn-block" onClick={handleNext}>
                   다음 질문으로
                 </button>
