@@ -319,9 +319,9 @@ async def submit_answer(
             "reason": "AI 분석 동의(ANALYSIS)가 없어 상세 말하기 습관 분석을 실행하지 않았습니다.",
         }
 
-    # 실제 영상/음성 기반 전달 분석. 캘리브레이션 웹 연결 전이므로 calibration=None.
-    # 이 경우 delivery_profile이 시선/자세를 자동으로 score_eligible=False 처리합니다.
-    if analysis_consent and video_path_str:
+    # 캘리브레이션 웹 연결 전이므로 calibration=None.
+    # 영상 분석이 실패하더라도 오디오 품질 검사는 가능한 한 별도로 유지됩니다.
+    if analysis_consent:
         delivery_analysis = analyze_answer_delivery(
             video_path=video_path_str,
             audio_path=str(audio_path),
@@ -335,25 +335,23 @@ async def submit_answer(
             session, answer.answer_id, delivery_analysis.get("events") or []
         )
         delivery_analysis["timeline_event_count"] = delivery_event_count
-        # 내부 호환값은 API 응답에서 제외하고, score-ready profile만 프론트에 전달합니다.
         delivery_analysis.pop("legacy_metrics", None)
         delivery_analysis.pop("events", None)
-    elif not analysis_consent:
+    else:
         delivery_analysis = {
             "status": "not_run",
             "reason": "AI 분석 동의(ANALYSIS)가 없어 전달 분석을 실행하지 않았습니다.",
             "delivery_profile": None,
-        }
-    else:
-        delivery_analysis = {
-            "status": "unavailable",
-            "reason": "답변 영상이 없어 비언어 전달 분석을 실행하지 않았습니다.",
-            "delivery_profile": None,
+            "audio_quality": None,
         }
 
     delivery_profile = delivery_analysis.get("delivery_profile") or {}
     measurement = delivery_profile.get("measurement") or {}
+    audio_quality = delivery_analysis.get("audio_quality") or {}
+
     analysis_allowed_by_audio = measurement.get("language_analysis_allowed") is not False
+    if audio_quality and audio_quality.get("is_valid") is False:
+        analysis_allowed_by_audio = False
 
     analysis_id = None
     analysis_note = None
@@ -363,7 +361,11 @@ async def submit_answer(
         analysis_note = "AI 분석 동의(ANALYSIS)가 없어 내용평가를 건너뜁니다."
         analysis_retry_allowed = False
     elif not analysis_allowed_by_audio:
-        issue_codes = measurement.get("audio_issue_codes") or []
+        issue_codes = measurement.get("audio_issue_codes") or [
+            item.get("code")
+            for item in (audio_quality.get("issues") or [])
+            if isinstance(item, dict) and item.get("code")
+        ]
         issue_text = ", ".join(issue_codes) if issue_codes else "오디오 품질 문제"
         analysis_note = f"{issue_text}로 측정이 어려워 내용평가를 실행하지 않았습니다. 답변을 다시 녹화해주세요."
         analysis_retry_allowed = False
