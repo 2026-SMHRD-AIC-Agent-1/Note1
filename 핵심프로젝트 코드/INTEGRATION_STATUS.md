@@ -19,6 +19,43 @@
   - 최대 3회
   - 같은 세션 안에서 이어지는 꼬리질문과, 다음 회차 연습 질문은 서로 다른 기능
 
+## 1단계 통합 규격 — 확정
+
+GitHub `main`을 팀의 최종 기준으로 사용한다.
+
+전체 통합 규격 기준:
+
+- `핵심프로젝트 코드/backend/integration_contract_v1.py`
+  - 공통 변수명
+  - 상태값
+  - 캘리브레이션 실패 코드
+  - 타임라인 이벤트명
+  - delivery_profile canonical 구조 정규화
+- `핵심프로젝트 코드/backend/integration_models.py`
+  - `CALIBRATION_PROFILES`
+  - `DELIVERY_ANALYSES`
+  - `DELIVERY_SESSION_SUMMARIES`
+- `핵심프로젝트 코드/INTEGRATION_CONTRACT_V1.md`
+  - 팀 공유용 전체 이동 경로와 파트별 소유권
+
+기존 코드에 이미 있는 이름을 우선 채택했고, 새 기능도 같은 이름을 사용하도록 규격을 선확정했다.
+
+핵심 원칙:
+
+- `overall_score` = 내용 종합 점수
+- 답변별 전달점수 = `delivery_score`
+- 세션 전달 평균 = `delivery_score_average`
+- 둘은 현재 합산하지 않음
+- 전달분석은 `delivery_profile.components.*` 구조 사용
+- canonical 자세 키 = `posture_stability`
+- `head_posture_stability`는 하위 호환 alias
+- 측정 실패 = `measurement_unavailable`, 0점 처리 금지
+- 캘리브레이션 결과는 세션 단위로 1개 저장 후 모든 질문에 재사용
+- `FILLER_WORD` 레거시 이벤트는 사용자 타임라인에서 제외
+- 머뭇거림/반복 표현은 점수 제외
+
+앞으로 새 변수가 필요하면 각 파트가 독자적으로 이름을 만들지 않고 통합 규격을 먼저 수정한 뒤 구현한다.
+
 ## 현재 연결된 부분
 
 ### 1. 내용평가 흐름
@@ -67,6 +104,7 @@
 - 캘리브레이션 전 시선·자세 이벤트는 사용자 타임라인에 저장하지 않음
 - 실제 오디오 품질이 측정 불가이면 내용평가를 강행하지 않고 재녹화를 권장
 - 영상 얼굴 분석이 실패해도 가능한 경우 오디오 품질 검사는 별도로 유지
+- Backend 브리지는 `integration_contract_v1.py`의 canonical delivery_profile으로 정규화
 
 ### 4. RAG/언어 AI 결과 형식 정리
 현재 질문 생성·답변 평가·최종 코칭의 핵심 필드는 이미 통일되어 있다.
@@ -105,7 +143,7 @@ A!SK는 3개 질문을, 심층면접은 실제로 생성된 첫 질문과 꼬리
 
 ## 현재 남은 핵심 작업
 
-### 최우선: 웹 캘리브레이션 연결
+### 2단계 최우선: 웹 캘리브레이션 연결
 확정된 V1 기준:
 - A!SK와 심층면접 모두 공통 적용
 - 시각 캘리브레이션 하드 게이트
@@ -114,14 +152,17 @@ A!SK는 3개 질문을, 심층면접은 실제로 생성된 첫 질문과 꼬리
 - 3초 연속 안정 유지
 - 음성 환경 확인 고정 문장
 - 통과 전 실제 질문 시작 불가
+- 결과 저장은 `CALIBRATION_PROFILES` 규격 사용
 
-현재 Python 캘리브레이션 로직은 있으나 React/FastAPI 사용자 흐름에는 아직 연결되지 않았다.
+현재 Python 캘리브레이션 로직과 저장 규격은 있으나 React/FastAPI 사용자 흐름에는 아직 연결되지 않았다.
 
 ### 캘리브레이션 이후
-- 캘리브레이션 프로파일을 해당 세션의 모든 답변 분석에 재사용
+- `session_id`로 캘리브레이션 프로파일 조회
+- 해당 세션의 모든 답변 분석에 재사용
 - 시선 1초 이상 이탈 평가
 - 자세 2초 이상 이탈 평가
-- 질문별 결과 → 세션 평균
+- canonical `delivery_profile`을 `DELIVERY_ANALYSES`에 저장
+- 질문별 결과 → `DELIVERY_SESSION_SUMMARIES` 세션 평균
 - 전달 안정성 최종 가중치/점수 구간 확정
 - 최종 전달 코칭 문구 연결
 
@@ -131,6 +172,7 @@ A!SK는 3개 질문을, 심층면접은 실제로 생성된 첫 질문과 꼬리
 - OpenAI STT/RAG 호출
 - MediaPipe/OpenCV/librosa 비언어 분석
 - 녹화 파일 형식과 ffmpeg 변환
+- 신규 통합 규격 테이블이 로컬 DB에 생성되는지 확인
 
 ## 아직 하지 않을 것
 
