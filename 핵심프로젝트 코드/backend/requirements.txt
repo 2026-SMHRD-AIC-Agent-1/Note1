@@ -17,3 +17,10 @@ faiss-cpu
 pypdf
 pydantic>=2
 numpy
+
+# Local nonverbal analysis demo
+opencv-python
+mediapipe==0.10.14
+librosa
+soundfile
+scipy
