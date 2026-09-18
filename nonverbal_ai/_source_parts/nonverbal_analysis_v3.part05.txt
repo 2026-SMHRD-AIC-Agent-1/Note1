@@ -1,0 +1,325 @@
+    return {
+        "voice_mean_db_baseline": mean_db_baseline,
+        "voice_f0_mean_baseline": round(sum(f0_values) / len(f0_values), 1),
+        "voice_f0_std_baseline": round(std_dev(f0_values), 1),
+        "speaking_speed_baseline": speaking_speed_baseline,
+        "voice_calibration_valid": True,
+        "voice_calibration_message": "정상",
+    }
+
+
+def extract_voice_calibration_metrics(calibration_audio_path: str, script_text: str = CALIBRATION_SCRIPT_TEXT) -> dict:
+    """
+    낭독 캘리브레이션 오디오 파일을 읽어 build_voice_calibration_profile()에 필요한
+    원본값을 뽑고 바로 결과 dict까지 계산해 반환한다. librosa 호출은 이 함수에서만 함.
+    [출력] build_voice_calibration_profile()과 동일한 dict
+    """
+    import numpy as np
+    import librosa
+
+    _, rms_list = extract_rms_from_audio(calibration_audio_path)
+
+    y, sr = librosa.load(calibration_audio_path, sr=None, mono=True)
+    duration_sec = float(librosa.get_duration(y=y, sr=sr))
+
+    f0, _voiced_flag, _ = librosa.pyin(
+        y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=sr
+    )
+    f0_values = [float(v) for v in f0 if not np.isnan(v)]
+
+    return build_voice_calibration_profile(rms_list, f0_values, duration_sec, script_text=script_text)
+
+
+def calculate_speaking_speed(stt_text: str, speaking_duration_sec: float) -> dict:
+    """
+    [출력] speaking_speed(음절/분), syllables_per_sec(음절/초)
+    [단위 - v0.3.3 변경] 원래 stt_text.split()으로 "단어 수"를 세서 WPM(분당 단어)으로
+    냈었는데, 한국어는 공백 기준으로 쪼개면 "단어"가 아니라 "어절"이 나와서(예: "저는
+    오늘 면접을 보러 왔습니다" = 5어절이지 5단어가 아님) 영어 WPM 개념과 안 맞았음.
+    한국어는 한 글자=한 음절이라 음절 수 기반이 훨씬 언어학적으로 정확하고 국어교육/
+    말하기속도 연구에서도 보통 "음절/분"을 씀 - 그래서 speaking_speed를 음절/분 기준
+    하나로 통일함 (기존 syllables_per_sec와 같은 음절수 기반이라 서로 60배 관계).
+    """
+    if speaking_duration_sec <= 0:
+        raise ValueError("speaking_duration_sec은 0보다 커야 합니다.")
+    syllable_count = len(stt_text.replace(" ", ""))
+    speaking_speed_per_min = syllable_count / (speaking_duration_sec / 60.0)
+    return {
+        "speaking_speed": round(speaking_speed_per_min, 1),  # 음절/분
+        "syllables_per_sec": round(syllable_count / speaking_duration_sec, 2),  # 음절/초
+    }
+
+
+DEFAULT_FILLER_WORDS = ["어", "음", "그", "저기", "그니까", "약간", "뭐랄까"]
+FILLER_EPISODE_GAP_SEC = 1.0  # 이 시간 이내에 연속된 필러워드는 1 episode로 묶음
+
+
+def count_filler_words(
+    stt_text: str,
+    filler_words: Optional[List[str]] = None,
+    word_timestamps: Optional[List[Tuple[str, float]]] = None,
+    total_duration_sec: Optional[float] = None,
+) -> dict:
+    """
+    [입력]
+        stt_text: STT 변환 텍스트
+        filler_words: 필러워드 사전 (없으면 DEFAULT_FILLER_WORDS 사용)
+        word_timestamps: (단어, 발생시각초) 리스트. STT가 단어별 타임스탬프를 줄 때만 사용.
+                          RAG·언어 AI 파트의 STT 출력 형식이 확정되면 연결 예정.
+        total_duration_sec: 전체 답변 시간(초). filler_per_min 계산에 필요.
+
+    [출력]
+        word_timestamps가 없으면: {"filler_word_count": int}만 반환 (지금 기본 동작 - 이벤트 없음,
+            개별 발생 시각을 모르니 nonverbal_events에 넣을 수가 없음)
+        word_timestamps가 있으면: 아래 필드 모두 반환
+        {
+            "filler_word_count": int,       # 총 발생 횟수
+            "filler_episode_count": int,    # 1초 이내 연속 발생은 1 episode로 묶은 횟수
+            "filler_per_min": float,        # 분당 발생 횟수 (total_duration_sec 필요)
+            "filler_timestamps": list[float],  # 각 발생 시각(초)
+            "filler_events": list[NonverbalEvent],  # FILLER_WORD 순간 이벤트, value=실제 단어
+        }
+    """
+    filler_words = filler_words or DEFAULT_FILLER_WORDS
+    text_count = sum(stt_text.count(w) for w in filler_words)
+
+    if word_timestamps is None:
+        # TODO: STT 단어별 타임스탬프가 오면 이 분기는 자연히 없어짐
+        return {"filler_word_count": text_count}
+
+    occurrences = sorted(((w, t) for w, t in word_timestamps if w in filler_words), key=lambda wt: wt[1])
+    filler_timestamps = [t for _w, t in occurrences]
+
+    # 1초 이내 연속 발생은 하나의 episode로 묶기
+    episode_count = 0
+    prev_t: Optional[float] = None
+    for _w, t in occurrences:
+        if prev_t is None or (t - prev_t) > FILLER_EPISODE_GAP_SEC:
+            episode_count += 1
+        prev_t = t
+
+    result = {
+        "filler_word_count": len(occurrences),
+        "filler_episode_count": episode_count,
+        "filler_timestamps": filler_timestamps,
+        "filler_events": [
+            NonverbalEvent(event_type=EVENT_TYPE_FILLER_WORD, start_time_sec=round(t, 2), end_time_sec=None, value=w)
+            for w, t in occurrences
+        ],
+    }
+
+    if total_duration_sec and total_duration_sec > 0:
+        result["filler_per_min"] = round(len(occurrences) / (total_duration_sec / 60.0), 1)
+    else:
+        result["filler_per_min"] = None  # 전체 시간 정보 없으면 계산 불가
+
+    return result
+
+
+def _compute_voice_relative_metrics(
+    mean_db: Optional[float],
+    f0_std: Optional[float],
+    speaking_speed: Optional[float],
+    calibration: CalibrationProfile,
+) -> dict:
+    """
+    캘리브레이션 낭독 baseline 대비 상대값을 계산한다.
+    절대 dB/Hz/음절속도만으로는 마이크 거리, 원래 저음/고음, 원래 말 빠르기 같은 개인차를
+    구분하지 못해 "저음인 사람은 항상 단조롭게, 말이 원래 느린 사람은 항상 느리게"
+    보이는 문제가 생긴다 - 이 상대값(비율/차이)이 그 개인차를 상쇄한다.
+
+    [출력]
+        volume_relative_db: 이번 답변 평균음량 - 캘리브레이션 평균음량 (양수=평소보다 크게 말함)
+        pitch_variation_relative_ratio: 이번 답변 f0_std / 캘리브레이션 f0_std
+            (1.0 근처=평소와 비슷한 억양, 뚜렷이 낮으면 단조로움 의심)
+        speaking_speed_relative_ratio: 이번 답변 speaking_speed / 캘리브레이션 speaking_speed
+    [주의] calibration.voice_calibration_valid가 True일 때만 호출할 것 - 호출부(analyze_voice)에서 확인함.
+    """
+    out: Dict = {}
+    if mean_db is not None and calibration.voice_mean_db_baseline is not None:
+        out["volume_relative_db"] = round(mean_db - calibration.voice_mean_db_baseline, 2)
+    if f0_std is not None and calibration.voice_f0_std_baseline:
+        out["pitch_variation_relative_ratio"] = round(f0_std / calibration.voice_f0_std_baseline, 2)
+    if speaking_speed is not None and calibration.speaking_speed_baseline:
+        out["speaking_speed_relative_ratio"] = round(speaking_speed / calibration.speaking_speed_baseline, 2)
+    return out
+
+
+def analyze_voice(
+    audio_path: str,
+    stt_text: Optional[str] = None,
+    word_timestamps: Optional[List[Tuple[str, float]]] = None,
+    calibration: Optional[CalibrationProfile] = None,
+) -> dict:
+    """음성 5개 항목(침묵/음량/피치/발화속도/필러워드)을 종합.
+    word_timestamps가 있으면 필러워드 episode/분당횟수/타임스탬프까지 함께 계산.
+    calibration(voice_calibration_valid=True인 경우)을 넘기면 baseline 대비 상대값
+    (volume_relative_db 등)도 함께 반환 - 절대값 필드는 그대로 유지되므로 기존
+    DB 필드 매핑에 영향 없음(상대값은 신규 필드, Backend와 이름/채택 여부 확정 필요)."""
+    result = {}
+    result.update(analyze_silence(audio_path))
+    result.update(analyze_volume(audio_path))
+    result.update(analyze_pitch_variation(audio_path))
+
+    if stt_text is not None:
+        timestamps, _ = extract_rms_from_audio(audio_path)
+        total_duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.0
+        speaking_duration = max(total_duration - result["total_pause_sec"], 0.1)
+        result.update(calculate_speaking_speed(stt_text, speaking_duration))
+        result.update(count_filler_words(stt_text, word_timestamps=word_timestamps, total_duration_sec=total_duration))
+
+    if calibration is not None and calibration.voice_calibration_valid:
+        result.update(_compute_voice_relative_metrics(
+            mean_db=result.get("mean_db"),
+            f0_std=result.get("f0_std"),
+            speaking_speed=result.get("speaking_speed"),
+            calibration=calibration,
+        ))
+
+    return result
+
+
+def extract_event_log(result: dict) -> List[dict]:
+    """
+    analyze_video() 결과 dict에서 "*_events" 키(각 analyze_* 함수가 채운 NonverbalEvent
+    리스트)를 전부 모아 하나의 타임라인으로 합친다.
+
+    [입력] result: analyze_video()가 조립 중인 dict (또는 그 결과물)
+    [출력] start_time_sec 기준 정렬된 dict 리스트. NonverbalEvent를 dict로 변환해서 반환하는
+        이유는 JSON 직렬화(FastAPI 응답, DB insert)를 바로 할 수 있게 하기 위함
+        (Image1 테이블의 event_type/start_time_sec/end_time_sec/value와 1:1 대응,
+        event_id/answer_id는 Backend가 DB insert 시 채움).
+    """
+    events: List[NonverbalEvent] = []
+    for key, value in result.items():
+        if key.endswith("_events") and isinstance(value, list):
+            events.extend(value)
+
+    events.sort(key=lambda e: e.start_time_sec)
+    return [asdict(e) for e in events]
+
+
+# ====================================================================
+# 8. 전체 진입점
+# ====================================================================
+
+def analyze_video(
+    video_path: str,
+    audio_path: Optional[str] = None,
+    stt_text: Optional[str] = None,
+    word_timestamps: Optional[List[Tuple[str, float]]] = None,
+    calibration_video_path: Optional[str] = None,
+    calibration_audio_path: Optional[str] = None,
+    calibration: Optional[CalibrationProfile] = None,
+) -> dict:
+    """
+    [입력]
+        video_path, audio_path(선택), stt_text(선택), word_timestamps(선택 - STT 단어별 타임스탬프)
+        calibration_video_path: 세션 시작 전 캘리브레이션 클립 경로. 넘기면 이 함수 내부에서
+            extract_calibration_profile()로 프로파일을 만들어 사용함.
+        calibration_audio_path: 같은 캘리브레이션 구간에서 CALIBRATION_SCRIPT_TEXT를
+            낭독한 오디오 경로 (선택). calibration_video_path와 함께 넘겨야 효과가 있음 -
+            넘기면 음량/피치/발화속도 상대값(volume_relative_db 등)까지 함께 계산됨.
+        calibration: 이미 계산해둔 CalibrationProfile을 직접 넘기고 싶을 때 사용
+            (예: 캘리브레이션을 세션 시작 시점에 미리 한 번만 계산해두고 여러 번 재사용하는 경우).
+            calibration_video_path/calibration_audio_path와 calibration을 둘 다 넘기면 calibration이 우선함.
+        전부 생략하면 v0.2 방식(본 영상 자체 첫 3초)으로 폴백함 - 실서비스 비권장,
+        캘리브레이션 없이 넘어가는 경로는 결과 dict에 "calibration_used": False로 표시됨.
+
+    [출력] 14개 항목(음성감정 제외) 전체를 합친 dict + calibration_used(bool), 
+        calibration_valid/calibration_message(캘리브레이션을 실제로 사용한 경우만 포함)
+        + "events": nonverbal_events 테이블에 그대로 insert 가능한 dict 리스트
+        (event_type/start_time_sec/end_time_sec/value, extract_event_log 참고).
+        각 analyze_* 함수가 채운 개별 "*_events" 키(예: gaze_events)는 이 통합 리스트로
+        합쳐진 뒤 결과에서 제거함 (요약 필드와 원본 이벤트가 뒤섞여 있으면 Backend가
+        DB 필드 매핑할 때 헷갈릴 수 있어서 - map_to_db_fields는 flat 통계 필드만 다룸).
+        + audio_path를 넘긴 경우 "audio_quality": check_audio_quality() 결과
+        ({"is_valid": bool, "issues": [...]})도 함께 포함됨 - FR-AI-010 대응, 마이크
+        문제/소음 문제를 감지해 안내 문구까지 담아줌 (하드 블록은 호출부가 결정).
+        마이크가 거의 안 잡혀서(MIC_SILENT) 음성 분석 자체가 불가능한 경우, 음성 관련
+        필드들은 채워지지 않고 대신 "voice_analysis_error"에 실패 사유가 담김 - 이 경우도
+        얼굴/자세 분석 결과까지 전부 날리지 않고 살려서 반환함(소프트 게이트).
+    """
+    result: Dict = {}
+
+    if calibration is None and calibration_video_path is not None:
+        calibration = extract_calibration_profile(calibration_video_path, calibration_audio_path=calibration_audio_path)
+
+    result["calibration_used"] = calibration is not None
+    if calibration is not None:
+        result["calibration_valid"] = calibration.is_valid
+        result["calibration_message"] = calibration.validation_message
+        result["voice_calibration_valid"] = calibration.voice_calibration_valid
+        result["voice_calibration_message"] = calibration.voice_calibration_message
+
+    face_series = extract_face_mesh_series(video_path)
+    result.update(analyze_face_direction(face_series, calibration=calibration))
+    result.update(analyze_gaze_direction(face_series, calibration=calibration))
+    result.update(analyze_blink(face_series, calibration=calibration))
+    result.update(analyze_smile(face_series, calibration=calibration))
+    result.update(analyze_expression_variation(face_series, calibration=calibration))
+    result.update(analyze_nod_shake(face_series, calibration=calibration))
+
+    pose_series = extract_pose_series(video_path, calibration=calibration)
+    result.update(analyze_body_movement(pose_series))
+    result.update(analyze_hand_gesture(pose_series))
+
+    if audio_path is not None:
+        result["audio_quality"] = check_audio_quality_from_file(audio_path)
+        try:
+            result.update(analyze_voice(audio_path, stt_text=stt_text, word_timestamps=word_timestamps, calibration=calibration))
+        except ValueError as e:
+            # 마이크가 거의 안 잡힌 경우(MIC_SILENT) 등 음성 신호 자체가 없으면
+            # analyze_volume/analyze_silence 등이 "무음이 아닌 구간을 찾지 못함"으로 실패함.
+            # audio_quality에 이미 원인이 담겨 있으니, 여기서 전체를 죽이지 않고
+            # 음성 관련 필드만 비운 채(None) 얼굴/자세 결과는 살려서 반환함 (소프트 게이트).
+            result["voice_analysis_error"] = str(e)
+
+    result["events"] = extract_event_log(result)
+    for key in [k for k in result if k.endswith("_events") and k != "events"]:
+        del result[key]
+
+    return result
+
+
+# ====================================================================
+# 9. 단위 테스트 (mediapipe/librosa 없이, 합성 데이터로 로직만 검증)
+# ====================================================================
+
+def _test_detect_episodes():
+    timestamps = [round(i * 0.1, 2) for i in range(31)]
+    values = [0.0] * 31
+    for i, t in enumerate(timestamps):
+        if 1.0 <= t <= 1.6:
+            values[i] = 1.0
+        if 2.0 <= t <= 2.2:
+            values[i] = 1.0
+    config = EpisodeConfig(min_exceed_duration_sec=0.5, min_return_duration_sec=0.3)
+    episodes = detect_episodes(timestamps, values, lambda v: v >= 0.5, config)
+    count, total_sec = summarize_episodes(episodes)
+    assert count == 1
+    print("[PASS] detect_episodes: 짧은 이탈 무시, 긴 이탈만 1회 카운트 ->", count, round(total_sec, 2), "초")
+
+
+def _test_blink_logic():
+    """가짜 EAR 시계열로 눈깜빡임 로직 검증 (뜬 상태 0.3 -> 감은 상태 0.05, 짧게 2번)"""
+    timestamps = [round(i * (1 / 30), 3) for i in range(90)]  # 3초, 30fps
+    ear = [0.30] * 90
+    for i in range(30, 33):   # 1.0~1.1초 사이 짧게 감음 (1회)
+        ear[i] = 0.05
+    for i in range(60, 63):   # 2.0~2.1초 사이 다시 감음 (1회)
+        ear[i] = 0.05
+
+    series = FaceMeshSeries(timestamps, [0]*90, [0]*90, [0]*90, [0.5]*90, ear, [0]*90, [0]*90)
+    result = analyze_blink(series)
+    print("[PASS] analyze_blink 결과:", result)
+    assert result["blink_count_total"] == 2
+
+
+def _test_smile_logic():
+    """가짜 smile_score로 미소 episode 검증 (baseline 0.3 -> 0.5로 0.4초간 증가)"""
+    timestamps = [round(i * 0.1, 2) for i in range(40)]  # 4초
+    smile = [0.30] * 40
+    for i, t in enumerate(timestamps):
+        if 1.0 <= t <= 1.4:
+            smile[i] = 0.50  # baseline 대비 +0.20 (임계값 0.15 초과)

@@ -1,0 +1,303 @@
+    series = FaceMeshSeries(timestamps, [0]*40, [0]*40, [0]*40, [0.5]*40, [0.3]*40, smile, [0]*40)
+    result = analyze_smile(series)
+    print("[PASS] analyze_smile 결과:", result)
+    assert result["smile_episode_count"] == 1
+
+
+def _test_nod_shake_logic():
+    """가짜 pitch 시계열로 끄덕임 카운트 검증 (baseline 0도 -> 12도로 0.4초간 이동 후 복귀)"""
+    timestamps = [round(i * 0.05, 2) for i in range(80)]  # 4초, 20fps 가정
+    pitch = [0.0] * 80
+    for i, t in enumerate(timestamps):
+        if 1.0 <= t <= 1.4:
+            pitch[i] = 12.0  # 임계값(8도) 초과, 0.4초 지속 (0.2~1.5초 범위 안에 듦)
+
+    series = FaceMeshSeries(timestamps, [0.0]*80, pitch, [0]*80, [0.5]*80, [0.3]*80, [0]*80, [0]*80)
+    result = analyze_nod_shake(series)
+    print("[PASS] analyze_nod_shake 결과:", result)
+    assert result["nod_count"] == 1
+
+
+def _test_speaking_speed_and_filler():
+    sample_text = "저는 어 이번 프로젝트에서 음 팀장을 맡았습니다 그니까 일정 관리를 주로 했어요"
+    speed = calculate_speaking_speed(sample_text, speaking_duration_sec=10.0)
+    filler = count_filler_words(sample_text)
+    print("[PASS] speaking_speed:", speed, "/ filler(타임스탬프 없음):", filler)
+    assert speed["speaking_speed"] > 0
+    assert filler["filler_word_count"] >= 3
+
+
+def _test_filler_episode_with_timestamps():
+    """word_timestamps가 있을 때 episode 묶기가 되는지 검증 (1초 이내 연속=1 episode)"""
+    # "어" 두 번이 0.3초 간격(같은 episode), "음"은 5초 뒤 혼자 발생(다른 episode)
+    word_timestamps = [
+        ("저는", 0.0), ("어", 1.0), ("어", 1.3), ("프로젝트에서", 2.0),
+        ("음", 6.0), ("맡았습니다", 6.5),
+    ]
+    result = count_filler_words("저는 어 어 프로젝트에서 음 맡았습니다", word_timestamps=word_timestamps, total_duration_sec=10.0)
+    print("[PASS] filler(타임스탬프 있음):", result)
+    assert result["filler_word_count"] == 3       # "어","어","음"
+    assert result["filler_episode_count"] == 2     # (어,어)=1 episode + (음)=1 episode
+    assert result["filler_per_min"] == 18.0        # 3회 / (10초/60)
+
+
+def _test_body_movement_logic():
+    """가짜 어깨중심 이동량 + 각도로 상체움직임 episode 검증 (OR 조건 확인)"""
+    timestamps = [round(i * 0.1, 2) for i in range(50)]  # 5초
+    shift = [0.02] * 50   # 평소 미세한 흔들림 (8% 미만)
+    angle = [1.0] * 50    # 평소 미세한 각도 변화 (8도 미만)
+
+    for i, t in enumerate(timestamps):
+        if 2.0 <= t <= 2.6:
+            shift[i] = 0.12  # 이동량 조건으로 이탈 (0.6초 지속)
+        if 3.5 <= t <= 4.0:
+            angle[i] = 10.0  # 각도 조건만으로 이탈 (0.5초 지속) - OR 조건 검증용
+
+    series = PoseSeries(timestamps, shift, angle, [0.0] * 50)
+    result = analyze_body_movement(series)
+    print("[PASS] analyze_body_movement 결과:", result)
+    assert result["body_movement_count"] == 2  # 이동량 이탈 1회 + 각도만으로 이탈 1회
+
+
+def _test_median():
+    assert median([1.0, 2.0, 3.0]) == 2.0
+    assert median([1.0, 2.0, 3.0, 4.0]) == 2.5
+    # 이상치(outlier) 하나가 있어도 평균과 달리 중앙값은 거의 안 흔들려야 함
+    values_with_outlier = [0.5, 0.5, 0.5, 0.5, 0.05]  # 눈깜빡임 한 프레임(0.05)이 섞인 EAR 상황 가정
+    assert median(values_with_outlier) == 0.5
+    mean_value = sum(values_with_outlier) / len(values_with_outlier)
+    assert mean_value < 0.5  # 평균은 이상치에 끌려 내려감 -> median 채택 이유를 재확인
+    print("[PASS] median: 이상치에 강함 (median=0.5, mean=", round(mean_value, 3), ")")
+
+
+def _test_calibration_profile_valid():
+    """정상적인 캘리브레이션 클립(가만히 정면 응시)이면 is_valid=True가 나오는지 검증."""
+    timestamps = [round(i * (1 / 30), 3) for i in range(120)]  # 4초, 30fps
+    n = len(timestamps)
+    face_series = FaceMeshSeries(
+        timestamps=timestamps,
+        yaw=[1.0] * n, pitch=[-2.0] * n, roll=[0.5] * n,
+        gaze_ratio=[0.52] * n, ear=[0.30] * n, smile_score=[0.28] * n,
+        landmark_motion=[0.001] * n,  # 거의 안 움직임 -> 표준편차 매우 작음
+    )
+    pose_raw = PoseRawSeries(
+        timestamps=timestamps, fps=30.0,
+        shoulder_center=[(100.0, 100.0)] * n,
+        shoulder_width=[80.0] * n,
+        shoulder_angle_deg=[0.0] * n,
+        hand_center=[None] * n,
+    )
+    profile = build_calibration_profile_from_series(face_series, pose_raw, expected_frame_count=n)
+    print("[PASS] build_calibration_profile_from_series (정상 케이스):", profile)
+    assert profile.is_valid is True
+    assert profile.gaze_baseline == 0.52
+    assert profile.shoulder_width_baseline == 80.0
+
+
+def _test_calibration_profile_invalid_low_detection():
+    """감지율이 낮으면(=화면 밖 이탈 등) is_valid=False가 되는지 검증."""
+    timestamps = [round(i * (1 / 30), 3) for i in range(60)]  # 실제 감지된 프레임 60개
+    n = len(timestamps)
+    face_series = FaceMeshSeries(
+        timestamps=timestamps, yaw=[0.0] * n, pitch=[0.0] * n, roll=[0.0] * n,
+        gaze_ratio=[0.5] * n, ear=[0.3] * n, smile_score=[0.3] * n, landmark_motion=[0.001] * n,
+    )
+    pose_raw = PoseRawSeries(
+        timestamps=timestamps, fps=30.0,
+        shoulder_center=[(100.0, 100.0)] * n, shoulder_width=[80.0] * n,
+        shoulder_angle_deg=[0.0] * n, hand_center=[None] * n,
+    )
+    # 캘리브레이션 클립이 원래 120프레임(4초)이어야 하는데 60프레임만 감지됨 -> 감지율 50%
+    profile = build_calibration_profile_from_series(face_series, pose_raw, expected_frame_count=120)
+    print("[PASS] build_calibration_profile_from_series (감지율 낮음):", profile)
+    assert profile.is_valid is False
+    assert profile.detection_rate == 0.5
+
+
+def _test_compute_pose_deviations_with_calibration():
+    """캘리브레이션 profile의 shoulder_width_baseline이 정규화 기준으로 실제 쓰이는지 검증."""
+    timestamps = [round(i * 0.1, 2) for i in range(10)]
+    n = len(timestamps)
+    raw = PoseRawSeries(
+        timestamps=timestamps, fps=10.0,
+        shoulder_center=[(0.0, 0.0)] * 5 + [(20.0, 0.0)] * 5,  # 5번째 프레임에서 20px 이동
+        shoulder_width=[80.0] * n,
+        shoulder_angle_deg=[0.0] * n,
+        hand_center=[None] * n,
+    )
+    calibration = CalibrationProfile(
+        yaw_baseline=0, pitch_baseline=0, roll_baseline=0, gaze_baseline=0.5,
+        ear_baseline=0.3, smile_baseline=0.3, landmark_motion_baseline=0.0,
+        shoulder_width_baseline=100.0,  # 실제 관측된 shoulder_width(80)와 다른 값 -> calibration이 우선 적용되는지 확인용
+        shoulder_angle_baseline=0.0, is_valid=True, validation_message="정상", detection_rate=1.0,
+    )
+    result = compute_pose_deviations(raw, calibration=calibration)
+    # 20px 이동 / 100(calibration baseline) = 0.2 (raw의 shoulder_width=80을 썼다면 0.25가 나왔을 것)
+    assert abs(result.shoulder_center_shift[5] - 0.2) < 1e-6
+    print("[PASS] compute_pose_deviations: calibration의 shoulder_width_baseline이 정규화에 반영됨")
+
+
+def _test_gaze_direction_approx_mode():
+    """gaze_is_approx=True면 gaze_ratio 대신 yaw로 판정하고 gaze_data_source가 바뀌는지 검증."""
+    n = 60
+    timestamps = [round(i * 0.1, 2) for i in range(n)]
+    # baseline(처음 30프레임)은 정면(yaw=0), 이후 30프레임은 고개를 오른쪽으로 15도 돌림
+    yaw = [0.0] * 30 + [15.0] * 30
+    series = FaceMeshSeries(
+        timestamps=timestamps, yaw=yaw, pitch=[0.0] * n, roll=[0.0] * n,
+        gaze_ratio=[0.5] * n,  # 실제로는 안 쓰여야 함 (approx 모드라서)
+        ear=[0.3] * n, smile_score=[0.3] * n, landmark_motion=[0.001] * n,
+        gaze_is_approx=True,
+    )
+    result = analyze_gaze_direction(series)
+    print("[PASS] analyze_gaze_direction (approx 모드):", {k: v for k, v in result.items() if k != "gaze_events"})
+    assert result["gaze_data_source"] == "head_pose_approx"
+    assert result["gaze_deviation_count"] == 1
+    assert result["gaze_events"][0].value == "right"
+
+
+def _test_amplitude_to_db():
+    # ref=1.0 기준, amplitude=1.0이면 0dB
+    assert abs(_amplitude_to_db(1.0)) < 1e-6
+    # amplitude가 절반이면 약 -6dB (20*log10(0.5) ≈ -6.02)
+    assert abs(_amplitude_to_db(0.5) - (-6.02)) < 0.05
+    print("[PASS] _amplitude_to_db: librosa.amplitude_to_db와 동일 공식 확인")
+
+
+def _test_check_audio_quality_normal():
+    """조용한 구간(0.01)과 말하는 구간(0.2)이 뚜렷이 구분되는 정상 케이스."""
+    rms_list = [0.01] * 20 + [0.2, 0.22, 0.19, 0.21] * 20
+    result = check_audio_quality(rms_list)
+    print("[PASS] check_audio_quality (정상):", result)
+    assert result["is_valid"] is True
+    assert result["issues"] == []
+
+
+def _test_check_audio_quality_mic_silent():
+    """전체가 다 거의 무음(마이크 안 잡힘) 케이스."""
+    rms_list = [0.0001] * 100
+    result = check_audio_quality(rms_list)
+    print("[PASS] check_audio_quality (마이크 무음):", result)
+    assert result["is_valid"] is False
+    codes = [i["code"] for i in result["issues"]]
+    assert "MIC_SILENT" in codes
+    assert "LOW_SNR" not in codes  # MIC_SILENT일 땐 SNR 중복 안내 안 함
+
+
+def _test_check_audio_quality_too_noisy():
+    """가장 조용한 구간조차 시끄러운(배경소음 큼) 케이스."""
+    rms_list = [0.15] * 20 + [0.2] * 20  # "무음 구간"이라 할 게 없을 만큼 전체가 다 큼
+    result = check_audio_quality(rms_list)
+    print("[PASS] check_audio_quality (소음 심함):", result)
+    assert result["is_valid"] is False
+    assert "TOO_NOISY" in [i["code"] for i in result["issues"]]
+
+
+def _test_check_audio_quality_low_snr():
+    """마이크는 잡히는데 목소리와 배경음 차이가 작은(SNR 낮음) 케이스."""
+    rms_list = [0.03] * 20 + [0.05] * 20  # 최대(-26dB대)와 배경(-30dB대) 차이가 10dB 미만
+    result = check_audio_quality(rms_list)
+    print("[PASS] check_audio_quality (SNR 낮음):", result)
+    assert result["is_valid"] is False
+    assert "LOW_SNR" in [i["code"] for i in result["issues"]]
+
+
+def _test_voice_calibration_profile():
+    """정상적인 낭독 캘리브레이션(적당한 음량 + 피치 변화)이면 유효한 baseline이 나오는지 검증."""
+    # 무음(0.001) 구간과 유성음(0.3 부근, 살짝 흔들리게) 구간을 섞은 가짜 RMS
+    rms_list = [0.001] * 10 + [0.28, 0.30, 0.32, 0.29, 0.31, 0.30] * 10
+    f0_values = [150.0, 160.0, 145.0, 170.0, 155.0] * 20  # 가짜 피치 (평균 156Hz 부근, 약간의 변화)
+    script_text = CALIBRATION_SCRIPT_TEXT
+    profile = build_voice_calibration_profile(rms_list, f0_values, speaking_duration_sec=3.5, script_text=script_text)
+    print("[PASS] build_voice_calibration_profile (정상 케이스):", profile)
+    assert profile["voice_calibration_valid"] is True
+    assert profile["voice_mean_db_baseline"] is not None
+    assert profile["voice_f0_mean_baseline"] is not None
+    assert profile["speaking_speed_baseline"] is not None
+    # 발화속도 baseline이 calculate_speaking_speed와 같은 계산식을 쓰는지 직접 비교
+    expected_speed = calculate_speaking_speed(script_text, 3.5)["speaking_speed"]
+    assert profile["speaking_speed_baseline"] == expected_speed
+
+
+def _test_voice_calibration_profile_no_voice():
+    """마이크가 아예 안 잡혔을 때(RMS 전부 0에 가까움, 피치 없음) 무효 처리되는지 검증."""
+    profile = build_voice_calibration_profile([], [], speaking_duration_sec=0.0)
+    print("[PASS] build_voice_calibration_profile (음성 없음):", profile)
+    assert profile["voice_calibration_valid"] is False
+
+
+def _test_voice_relative_metrics():
+    """캘리브레이션 대비 상대값이 절대값의 개인차를 상쇄해주는지 검증
+    (동일한 '변화폭 2배' 상황이 저음/고음 화자 둘 다 같은 상대비율로 나와야 함)."""
+    calibration_low_pitch = CalibrationProfile(
+        yaw_baseline=0, pitch_baseline=0, roll_baseline=0, gaze_baseline=0.5,
+        ear_baseline=0.3, smile_baseline=0.3, landmark_motion_baseline=0.0,
+        shoulder_width_baseline=80.0, shoulder_angle_baseline=0.0,
+        is_valid=True, validation_message="정상", detection_rate=1.0,
+        voice_mean_db_baseline=-20.0, voice_f0_mean_baseline=110.0, voice_f0_std_baseline=5.0,
+        speaking_speed_baseline=120.0, voice_calibration_valid=True, voice_calibration_message="정상",
+    )
+    calibration_high_pitch = replace(calibration_low_pitch, voice_f0_mean_baseline=220.0, voice_f0_std_baseline=10.0)
+
+    # 저음 화자: 답변 중 f0_std가 baseline의 2배(=10)로 커짐 (풍부한 억양)
+    metrics_low = _compute_voice_relative_metrics(mean_db=-20.0, f0_std=10.0, speaking_speed=120.0, calibration=calibration_low_pitch)
+    # 고음 화자: 답변 중 f0_std가 baseline의 2배(=20)로 커짐 (마찬가지로 풍부한 억양)
+    metrics_high = _compute_voice_relative_metrics(mean_db=-20.0, f0_std=20.0, speaking_speed=120.0, calibration=calibration_high_pitch)
+
+    print("[PASS] _compute_voice_relative_metrics (저음):", metrics_low)
+    print("[PASS] _compute_voice_relative_metrics (고음):", metrics_high)
+    # 절대 Hz는 저음(10)과 고음(20)이 전혀 다르지만, baseline 대비 상대비율은 둘 다 2.0으로 같아야 함
+    assert metrics_low["pitch_variation_relative_ratio"] == metrics_high["pitch_variation_relative_ratio"] == 2.0
+
+
+def _test_extract_event_log():
+    """여러 analyze_* 결과의 *_events 키를 하나의 정렬된 dict 리스트로 합치는지 검증."""
+    fake_result = {
+        "gaze_deviation_count": 1,  # "_events"로 안 끝나는 키는 무시돼야 함
+        "gaze_events": [
+            NonverbalEvent(event_type=EVENT_TYPE_GAZE_AWAY, start_time_sec=5.0, end_time_sec=5.8, value="left"),
+        ],
+        "filler_events": [
+            NonverbalEvent(event_type=EVENT_TYPE_FILLER_WORD, start_time_sec=1.2, end_time_sec=None, value="어"),
+        ],
+        "body_movement_events": [],  # 빈 리스트도 문제없이 처리돼야 함
+    }
+    events = extract_event_log(fake_result)
+    print("[PASS] extract_event_log:", events)
+    assert len(events) == 2
+    assert events[0]["start_time_sec"] == 1.2  # 시간순 정렬 확인 (filler가 gaze보다 먼저)
+    assert events[0]["event_type"] == EVENT_TYPE_FILLER_WORD
+    assert isinstance(events[0], dict)  # NonverbalEvent가 아니라 dict로 변환됐는지 (JSON 직렬화용)
+
+
+# ====================================================================
+# 10. DB 필드 매핑 (analyze_video 결과 -> NonverbalMetrics 14개 필드)
+# ====================================================================
+
+# DB 필드 중 "값 1개만" 받는 구조라, 여러 값 중 하나를 골라야 하는 항목들.
+# 여기 적힌 선택은 제 임의 판단이며, Backend/PM과 다르게 정해지면 이 표만 고치면 됨.
+DB_FIELD_MAPPING_NOTES = {
+    "blink_rate": "blink_per_min 사용 (이름상 분당 비율이 맞다고 판단)",
+    "smile_intensity": "smile_avg_intensity 사용",
+    "upper_body_sway": "body_movement_score 사용 (횟수보다 '흔들림 정도'가 sway라는 이름에 더 맞다고 판단. "
+                        "body_movement_count를 원하면 여기만 바꾸면 됨)",
+    "head_nod_count": "nod_count + shake_count 합산 (주의: 끄덕임/젓기 구분이 사라짐. "
+                       "DB에 필드가 하나뿐이라 임시로 합침 - Backend와 확인 필요)",
+    "hand_gesture_rate": "gesture_per_min 사용",
+    "average_volume": "mean_db 사용",
+    "pitch_variation": "f0_std 사용 (표준편차. f0_range를 원하면 여기만 바꾸면 됨)",
+}
+
+
+def map_to_db_fields(result: dict) -> dict:
+    """
+    analyze_video()의 전체 결과(dict)를 받아서, PPT 명세서에 있는
+    NonverbalMetrics 테이블의 14개 필드명에 맞게 값 1개씩 뽑아 매핑한다.
+
+    [입력] result: analyze_video()가 반환한 dict (여러 세부값 포함)
+    [출력] DB 필드명 14개로 압축된 dict
+        {
+            "face_yaw": ..., "gaze_center_ratio": ..., "blink_rate": ...,
+            "smile_intensity": ..., "expression_change_count": ...,
+            "upper_body_sway": ..., "head_nod_count": ..., "hand_gesture_rate": ...,
+            "pause_count": ..., "average_volume": ..., "speaking_speed": ...,

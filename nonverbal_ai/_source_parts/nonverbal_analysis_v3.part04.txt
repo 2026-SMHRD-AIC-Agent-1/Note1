@@ -1,0 +1,326 @@
+    shoulder_angle_deviation = [_angle_diff(a, baseline_angle) for a in raw.shoulder_angle_deg]
+
+    hand_shift: List[float] = []
+    for hp in raw.hand_center:
+        if hp is None or baseline_hand is None:
+            hand_shift.append(0.0)
+        else:
+            dist = ((hp[0] - baseline_hand[0]) ** 2 + (hp[1] - baseline_hand[1]) ** 2) ** 0.5
+            hand_shift.append(dist / avg_shoulder_width)
+
+    return PoseSeries(
+        timestamps=timestamps,
+        shoulder_center_shift=shoulder_shift,
+        shoulder_angle_deg=shoulder_angle_deviation,
+        hand_center_shift=hand_shift,
+    )
+
+
+def extract_pose_series(video_path: str, calibration: Optional[CalibrationProfile] = None) -> PoseSeries:
+    """
+    하위 호환용 편의 함수: extract_pose_raw_series + compute_pose_deviations를 한 번에 실행.
+    calibration을 넘기면 그 기준으로, 생략하면 v0.2 방식(자체 첫 3초)으로 baseline을 잡는다.
+    """
+    raw = extract_pose_raw_series(video_path)
+    return compute_pose_deviations(raw, calibration=calibration)
+
+
+BODY_MOVEMENT_THRESHOLD_RATIO = 0.08
+BODY_MOVEMENT_ANGLE_THRESHOLD_DEG = 8.0
+BODY_MOVEMENT_EPISODE_CONFIG = EpisodeConfig(min_exceed_duration_sec=0.5, min_return_duration_sec=0.3)
+
+GESTURE_THRESHOLD_RATIO = 0.15
+GESTURE_EPISODE_CONFIG = EpisodeConfig(min_exceed_duration_sec=0.3, min_return_duration_sec=0.5)
+
+
+def analyze_body_movement(series: PoseSeries) -> dict:
+    """
+    [출력] body_movement_count, body_movement_total_sec, body_movement_score,
+        body_movement_events(BODY_MOVEMENT 리스트, extract_event_log 참고)
+    [판정 기준] 어깨중심 이동 8% 이상 "또는" 어깨선 각도 변화 8° 이상 -> 이탈 후보
+               (측정기준정의서 원문: "이동이 어깨너비의 8% 이상 또는 어깨선 각도 8° 이상 변화")
+    """
+    def is_moving(i: int) -> bool:
+        return series.shoulder_center_shift[i] >= BODY_MOVEMENT_THRESHOLD_RATIO or \
+               series.shoulder_angle_deg[i] >= BODY_MOVEMENT_ANGLE_THRESHOLD_DEG
+
+    # detect_episodes는 단일 값 시퀀스를 기대하므로, "이동 여부"를 0/1로 미리 변환
+    flags = [1.0 if is_moving(i) else 0.0 for i in range(len(series.timestamps))]
+    episodes = detect_episodes(series.timestamps, flags, lambda v: v >= 0.5, BODY_MOVEMENT_EPISODE_CONFIG)
+    count, total_sec = summarize_episodes(episodes)
+    return {
+        "body_movement_count": count,
+        "body_movement_total_sec": round(total_sec, 2),
+        "body_movement_score": round(sum(series.shoulder_center_shift) / len(series.shoulder_center_shift), 3),
+        "body_movement_events": _episodes_to_events(episodes, EVENT_TYPE_BODY_MOVEMENT),
+    }
+
+
+def analyze_hand_gesture(series: PoseSeries) -> dict:
+    """[출력] gesture_episode_count, gesture_per_min, gesture_total_sec,
+    hand_gesture_events(HAND_GESTURE 리스트, extract_event_log 참고)"""
+    episodes = detect_episodes(
+        series.timestamps, series.hand_center_shift,
+        lambda v: v >= GESTURE_THRESHOLD_RATIO, GESTURE_EPISODE_CONFIG,
+    )
+    count, total_sec = summarize_episodes(episodes)
+    total_duration_min = (series.timestamps[-1] - series.timestamps[0]) / 60.0
+    per_min = round(count / total_duration_min, 1) if total_duration_min > 0 else 0.0
+    return {
+        "gesture_episode_count": count,
+        "gesture_per_min": per_min,
+        "gesture_total_sec": round(total_sec, 2),
+        "hand_gesture_events": _episodes_to_events(episodes, EVENT_TYPE_HAND_GESTURE),
+    }
+
+
+# ====================================================================
+# 6. 캘리브레이션 프로파일 추출 (세션 시작 전 별도 클립, I/O)
+# ====================================================================
+
+def extract_calibration_profile(
+    calibration_video_path: str,
+    calibration_audio_path: Optional[str] = None,
+    expected_frame_count: Optional[int] = None,
+    script_text: str = CALIBRATION_SCRIPT_TEXT,
+) -> CalibrationProfile:
+    """
+    세션 시작 전 캘리브레이션 클립("카메라를 봐주세요" 안내 후 3~5초 촬영, 동시에
+    CALIBRATION_SCRIPT_TEXT 낭독)을 읽어 CalibrationProfile을 만든다. 실제 영상/음성
+    읽기(mediapipe/librosa)는 이 함수에서만 하고, 값 계산 로직은
+    build_calibration_profile_from_series / build_voice_calibration_profile로 분리해뒀음
+    (mediapipe/librosa 없이 합성 데이터로 로직 테스트 가능하도록).
+
+    [입력]
+        calibration_video_path: 캘리브레이션 클립 경로 (얼굴/자세용)
+        calibration_audio_path: 같은 캘리브레이션 구간의 오디오 경로 (음성용, 선택).
+            넘기면 결과 CalibrationProfile에 voice_*_baseline이 채워지고
+            voice_calibration_valid=True가 됨. 생략하면 음성 baseline 없이(=미실행)
+            얼굴/자세 baseline만 채워서 반환 - 본 분석 시 음성 상대값 계산은 건너뜀.
+        expected_frame_count: 감지율(detection_rate) 계산 기준 총 프레임 수.
+            생략하면 근사치로 처리됨 - build_calibration_profile_from_series 설명 참고.
+        script_text: 낭독한 고정 문장. calibration_audio_path를 넘길 때만 사용됨.
+    [출력] CalibrationProfile
+    [주의] mediapipe, opencv-python(+ librosa, calibration_audio_path 넘길 때) 필요.
+    """
+    face_series = extract_face_mesh_series(calibration_video_path)
+    pose_raw = extract_pose_raw_series(calibration_video_path)
+    profile = build_calibration_profile_from_series(face_series, pose_raw, expected_frame_count=expected_frame_count)
+
+    if calibration_audio_path is not None:
+        voice_metrics = extract_voice_calibration_metrics(calibration_audio_path, script_text=script_text)
+        profile = replace(profile, **voice_metrics)
+
+    return profile
+
+
+# ====================================================================
+# 7. 음성계열 (librosa)
+# ====================================================================
+
+SILENCE_MIN_DURATION_SEC = 0.25
+LONG_PAUSE_THRESHOLD_SEC = 1.0
+PAUSE_EPISODE_CONFIG = EpisodeConfig(min_exceed_duration_sec=SILENCE_MIN_DURATION_SEC, min_return_duration_sec=0.1)
+
+
+def extract_rms_from_audio(audio_path: str, frame_length: int = 2048, hop_length: int = 512) -> Tuple[List[float], List[float]]:
+    """[출력] (timestamps, rms_list) - librosa 필요, 실제 오디오 파일 필요"""
+    import librosa
+    y, sr = librosa.load(audio_path, sr=None, mono=True)
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    timestamps = librosa.frames_to_time(range(len(rms)), sr=sr, hop_length=hop_length).tolist()
+    return timestamps, rms.tolist()
+
+
+def _auto_silence_threshold(rms_list: List[float]) -> float:
+    sorted_rms = sorted(rms_list)
+    idx = max(0, int(len(sorted_rms) * 0.1) - 1)
+    return sorted_rms[idx]
+
+
+# --- 6-0. 마이크/소음 예외처리 (FR-AI-010 대응, v0.3.5 신규) ---
+
+MIC_SILENT_DB_THRESHOLD = -50.0    # 녹음 전체 중 가장 큰 소리도 이보다 작으면 "마이크가 아예 안 잡힘"
+NOISY_FLOOR_DB_THRESHOLD = -30.0   # 가장 조용한 구간(하위 10%)의 음량이 이보다 크면 "배경 소음이 심함"
+LOW_SNR_DB_THRESHOLD = 10.0        # (최대음량 - 무음구간음량) 차이가 이보다 작으면 "신호 대비 소음이 너무 큼"
+
+
+def check_audio_quality(rms_list: List[float]) -> dict:
+    """
+    순수 로직 함수 (librosa 없이 테스트 가능). RMS 리스트만 보고 마이크/소음 문제를 판정.
+
+    FR-AI-010("마이크 권한이 없거나...세션 시작을 제한하고 안내 문구를 표시")에서
+    "권한은 있는데 소리가 이상한" 케이스를 다룸 (권한 자체가 없는 경우는 브라우저/OS
+    레벨에서 걸러지므로 이 함수 담당이 아님 - Frontend가 getUserMedia 단계에서 처리).
+
+    [판정 기준]
+        - MIC_SILENT: 녹음 전체에서 가장 큰 소리도 사실상 무음 수준 -> 마이크 자체가
+          안 잡히고 있을 가능성 (음소거, 잘못된 입력장치 선택 등)
+        - TOO_NOISY: "가장 조용한 구간"조차 상당히 시끄러움 -> 주변 소음이 큼
+        - LOW_SNR: 목소리(최대음량)와 배경(무음구간음량)의 차이가 작음 -> 답변 음성과
+          배경 소음이 잘 구분 안 될 정도로 섞여 있을 가능성 (MIC_SILENT는 아닌데
+          답변 내용 분석 품질은 떨어질 수 있는 애매한 경우)
+
+    [출력] {"is_valid": bool, "issues": [{"code": ..., "message": ...}, ...]}
+        issues가 비어있으면 정상. 여러 문제가 동시에 감지될 수 있어 리스트로 반환함
+        (예: 마이크도 안 잡히면서 주변도 시끄러운 경우 둘 다 담김).
+        하드 블록은 이 함수가 아니라 호출부(Frontend/세션 시작 로직)가 결정할 일 -
+        이 함수는 판정과 안내 문구까지만 제공함 (다른 소프트 게이트들과 같은 설계).
+    """
+    if not rms_list:
+        return {
+            "is_valid": False,
+            "issues": [{"code": "MIC_SILENT", "message": "오디오가 녹음되지 않았어요. 마이크 연결을 확인해주세요."}],
+        }
+
+    peak_db = _amplitude_to_db(max(rms_list))
+    floor_db = _amplitude_to_db(_auto_silence_threshold(rms_list))
+    snr_db = peak_db - floor_db
+
+    issues = []
+    if peak_db <= MIC_SILENT_DB_THRESHOLD:
+        issues.append({"code": "MIC_SILENT", "message": "마이크 소리가 거의 감지되지 않았어요. 마이크 연결과 음소거 여부를 확인해주세요."})
+    if floor_db >= NOISY_FLOOR_DB_THRESHOLD:
+        issues.append({"code": "TOO_NOISY", "message": "주변 소음이 큰 것 같아요. 조용한 곳에서 다시 시도해주세요."})
+    # 마이크가 아예 안 잡힌 상태(MIC_SILENT)에서는 SNR 자체가 의미 없으니 중복 안내하지 않음
+    if peak_db > MIC_SILENT_DB_THRESHOLD and snr_db < LOW_SNR_DB_THRESHOLD:
+        issues.append({"code": "LOW_SNR", "message": "목소리와 배경 소음이 잘 구분되지 않아요. 마이크에 더 가까이서 말해주세요."})
+
+    return {"is_valid": len(issues) == 0, "issues": issues}
+
+
+def check_audio_quality_from_file(audio_path: str) -> dict:
+    """check_audio_quality()의 I/O 버전. audio_path에서 RMS를 직접 뽑아 판정까지 한 번에."""
+    _, rms_list = extract_rms_from_audio(audio_path)
+    return check_audio_quality(rms_list)
+
+
+def analyze_silence(audio_path: str, silence_rms_threshold: Optional[float] = None) -> dict:
+    """[출력] pause_count, total_pause_sec, avg_pause_sec, max_pause_sec, long_pause_count,
+    pause_ratio, silence_events(LONG_PAUSE 리스트 - 1초 미만 짧은 침묵은 너무 잦아
+    이벤트로 남기지 않고 1초 이상만 마커로 남김, extract_event_log 참고)"""
+    timestamps, rms_list = extract_rms_from_audio(audio_path)
+    threshold = silence_rms_threshold if silence_rms_threshold is not None else _auto_silence_threshold(rms_list)
+
+    episodes = detect_episodes(timestamps, rms_list, lambda v: v <= threshold, PAUSE_EPISODE_CONFIG)
+    count, total_sec = summarize_episodes(episodes)
+    avg_sec = round(total_sec / count, 2) if count else 0.0
+    max_sec = round(max((e.duration_sec for e in episodes), default=0.0), 2)
+    long_episodes = [e for e in episodes if e.duration_sec >= LONG_PAUSE_THRESHOLD_SEC]
+
+    total_duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.0
+    pause_ratio = round(total_sec / total_duration, 3) if total_duration > 0 else 0.0
+
+    return {
+        "pause_count": count, "total_pause_sec": round(total_sec, 2),
+        "avg_pause_sec": avg_sec, "max_pause_sec": max_sec,
+        "long_pause_count": len(long_episodes), "pause_ratio": pause_ratio,
+        "silence_events": _episodes_to_events(long_episodes, EVENT_TYPE_LONG_PAUSE),
+    }
+
+
+def analyze_volume(audio_path: str, silence_rms_threshold: Optional[float] = None) -> dict:
+    """[출력] mean_db, db_std, db_min, db_max (무음구간 제외)"""
+    import numpy as np
+    import librosa
+
+    timestamps, rms_list = extract_rms_from_audio(audio_path)
+    threshold = silence_rms_threshold if silence_rms_threshold is not None else _auto_silence_threshold(rms_list)
+    voiced = [v for v in rms_list if v > threshold]
+    if not voiced:
+        raise ValueError("무음이 아닌 구간을 찾지 못했습니다.")
+
+    db = librosa.amplitude_to_db(np.array(voiced), ref=1.0).tolist()
+    return {
+        "mean_db": round(sum(db) / len(db), 2),
+        "db_std": round(float(np.std(db)), 2),
+        "db_min": round(min(db), 2),
+        "db_max": round(max(db), 2),
+    }
+
+
+def analyze_pitch_variation(audio_path: str) -> dict:
+    """
+    [출력] f0_mean, f0_std, f0_range (Hz)
+    [주의] librosa.pyin 사용. 무음/비음성 구간(f0=nan)은 계산에서 제외.
+           성별·개인차가 커서 절대 Hz로 좋고 나쁨을 판단하지 않음.
+    """
+    import numpy as np
+    import librosa
+
+    y, sr = librosa.load(audio_path, sr=None, mono=True)
+    f0, voiced_flag, _ = librosa.pyin(
+        y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=sr
+    )
+    valid_f0 = f0[~np.isnan(f0)]
+    if len(valid_f0) == 0:
+        raise ValueError("피치를 추출하지 못했습니다 (유성음 구간 없음).")
+
+    return {
+        "f0_mean": round(float(np.mean(valid_f0)), 1),
+        "f0_std": round(float(np.std(valid_f0)), 1),
+        "f0_range": round(float(np.max(valid_f0) - np.min(valid_f0)), 1),
+    }
+
+
+# --- 6-1. 음성 캘리브레이션 (v0.3.1 신규) ---
+
+def _amplitude_to_db(amplitude: float, amin: float = 1e-5, ref: float = 1.0) -> float:
+    """
+    librosa.amplitude_to_db(x, ref=1.0)와 동일한 공식을 순수 파이썬으로 구현.
+    (build_voice_calibration_profile을 librosa 없이도 합성 데이터로 테스트할 수 있도록
+     I/O(librosa 호출)와 계산 로직을 분리하기 위함 - analyze_volume에서 실제 오디오로
+     계산할 때와 같은 기준값(ref=1.0)을 써야 두 값을 서로 비교할 수 있음)
+    """
+    return 20.0 * math.log10(max(amin, amplitude)) - 20.0 * math.log10(max(amin, ref))
+
+
+def build_voice_calibration_profile(
+    rms_list: List[float],
+    f0_values: List[float],
+    speaking_duration_sec: float,
+    script_text: str = CALIBRATION_SCRIPT_TEXT,
+) -> dict:
+    """
+    캘리브레이션 낭독 클립에서 뽑은 원본 RMS/피치 값으로부터 음성 baseline을 계산하는
+    순수 로직 함수 (librosa 없이 합성 데이터로 테스트 가능하도록 I/O와 분리).
+
+    [입력]
+        rms_list: extract_rms_from_audio()의 rms_list (낭독 구간 전체, 무음 포함)
+        f0_values: librosa.pyin 결과에서 nan(무성음) 제외한 유성 구간 f0 값들 (Hz)
+        speaking_duration_sec: 낭독 클립 전체 길이(초). 무음 제외 여부는 신경 안 씀 -
+            어차피 짧은 고정 문장이라 낭독 시작~끝 전체 시간을 그대로 씀.
+        script_text: 낭독한 고정 문장. word/syllable 수를 이미 알고 있어 STT 없이도
+            calculate_speaking_speed()를 그대로 재사용해 발화속도 baseline을 계산함.
+    [출력] dict (CalibrationProfile의 voice_* 필드에 그대로 병합 가능한 키로 구성)
+        voice_mean_db_baseline, voice_f0_mean_baseline, voice_f0_std_baseline,
+        speaking_speed_baseline, voice_calibration_valid, voice_calibration_message
+    """
+    if not rms_list or speaking_duration_sec <= 0:
+        return {
+            "voice_mean_db_baseline": None,
+            "voice_f0_mean_baseline": None,
+            "voice_f0_std_baseline": None,
+            "speaking_speed_baseline": None,
+            "voice_calibration_valid": False,
+            "voice_calibration_message": "음성이 녹음되지 않았어요. 마이크 연결을 확인하고 다시 시도해주세요.",
+        }
+
+    # 무음 구간(하위 10%) 제외 후 유성 구간만으로 음량 baseline 계산 (analyze_volume과 같은 기준)
+    threshold = _auto_silence_threshold(rms_list)
+    voiced_rms = [v for v in rms_list if v > threshold]
+    if not voiced_rms:
+        voiced_rms = rms_list  # 전부 걸러졌으면(=극단적 저음량) 그냥 전체로 근사
+
+    mean_db_baseline = round(sum(_amplitude_to_db(v) for v in voiced_rms) / len(voiced_rms), 2)
+    speaking_speed_baseline = calculate_speaking_speed(script_text, speaking_duration_sec)["speaking_speed"]
+
+    if not f0_values:
+        return {
+            "voice_mean_db_baseline": mean_db_baseline,
+            "voice_f0_mean_baseline": None,
+            "voice_f0_std_baseline": None,
+            "speaking_speed_baseline": speaking_speed_baseline,
+            "voice_calibration_valid": False,
+            "voice_calibration_message": "피치(음높이)를 추출하지 못했어요. 조용한 환경에서 또렷하게 읽어주세요.",
+        }

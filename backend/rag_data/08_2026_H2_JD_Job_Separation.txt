@@ -1,0 +1,128 @@
+2026년 하반기 SK하이닉스 Job Description - 직무 구분 및 핵심 추출
+작성일: 2026-08-21
+원본: [26년(하)] SK하이닉스 Talent hy-way(신입) Job Description.pdf
+원본 페이지: Solution SW p.6 / System Architecture · Software Solution p.10
+용도: AI 모의면접 RAG 데이터 정리 및 직무 범위 확정
+
+==================================================
+1. 이번 확인에서 가장 중요한 발견
+==================================================
+
+현재 2026년 하반기 공식 Job Description에서는
+'Solution SW'와 'System Architecture / Software Solution'이 서로 다른 모집 직무로 구분되어 있다.
+
+따라서 두 직무의 자료를 하나의 'Solution SW' 자료처럼 섞어서 사용하면
+RAG가 서로 다른 직무의 업무와 역량을 혼합할 수 있다.
+
+--------------------------------------------------
+A. Solution SW - 분당 (원본 p.6)
+--------------------------------------------------
+
+[직무 방향]
+AI 시대의 Data Center / Enterprise SSD 및 차세대 AI Memory 제품 경쟁력 확보를 위해
+System/SSD Architecture와 Firmware Platform을 설계·개발하고,
+HW-FW-SW 관점에서 성능·품질을 최적화하는 역할.
+
+[주요 경험/업무]
+1) SSD/System Architecture 설계 및 최적화
+- 고객 요구사항과 Standard Spec을 바탕으로 SSD Architecture와 IO Control Path 설계
+- HW/FW 관점의 성능 분석과 병목 최적화
+
+2) Firmware Platform 및 핵심 Algorithm 개발
+- PCIe/NVMe Host Interface부터 NAND Data 처리까지 Firmware Architecture 설계
+- 성능·수명·품질 향상을 위한 핵심 Algorithm 및 공통 Firmware Platform 개발
+
+3) Firmware 검증 및 개발 Process 고도화
+- Firmware 품질 목표와 검증 전략 수립
+- 검증 Infra/Tool 개발
+- Global 개발 Site에 적용 가능한 개발 Process와 Platform 구축
+
+4) AI Memory 및 System Software 기술 개발
+- AI Workload 및 Inference 환경 분석
+- System SW, Runtime, Compiler, AI Framework 등 HW-FW-SW 융합 기술 기반
+  차세대 AI Memory Solution 개발
+
+[공식 JD에 제시된 관련 역량/경험]
+- AI, 컴퓨터, 전기, 전자, 반도체, 데이터사이언스 관련 경험·역량
+- 컴퓨터 구조와 Microarchitecture에 대한 깊은 이해
+- C/C++ 및 Assembly 언어 활용
+- 성능 모델링 및 분석을 통한 복잡한 기술 문제 해결
+- Verilog/System Verilog 설계·검증 경험
+- Compiler 구조/최적화 또는 System Software 연구 경험
+- ARM 기반 Embedded System 연구·개발 경험
+- Cursor, Claude Code 등 AI 기반 IDE를 활용한 개발 생산성 향상 경험
+
+[RAG 질문을 만들 때 사용할 수 있는 축]
+- 고객 요구사항을 기술 설계로 변환한 경험
+- 시스템 성능 병목을 분석하고 최적화한 경험
+- Firmware/시스템 SW 설계 경험
+- 검증 및 품질 개선 경험
+- HW-SW를 함께 고려한 문제 해결
+- AI 개발도구를 실제 개발에 활용한 경험
+
+
+--------------------------------------------------
+B. System Architecture / Software Solution - 이천/분당 (원본 p.10)
+--------------------------------------------------
+
+[직무 방향]
+PIM/PNM, CXL, Custom HBM 등 차세대 솔루션 및 시스템 아키텍처 연구,
+차세대 메모리를 활용한 시스템 최적화,
+차별화된 메모리 기반 AI 솔루션 도출 및 신규 사업 기회 발굴.
+
+[System Architecture 주요 영역]
+- 데이터센터 아키텍처
+- xPU/SoC 아키텍처
+- 메모리 서브 시스템 아키텍처 및 HW-SW 수직 통합 최적화
+
+[Software Solution 주요 영역]
+1) AI 모델 연구
+- 차세대 AI 메모리용 새로운 AI 모델 아키텍처와 학습·추론 기법 연구
+
+2) 플랫폼 소프트웨어 연구
+- 실제 AI 워크로드 기반 시스템 구축 및 성능 평가
+- 차세대 메모리 기반 AI 플랫폼 소프트웨어 개발
+
+3) 시스템 소프트웨어 연구
+- Linux 기반 이종 메모리 관리 기법
+- PIM/PNM/NMP 등 연산 메모리를 위한 컴파일러 설계·구현
+
+[공식 JD에 제시된 관련 역량/경험]
+- 전산, 컴퓨터, 전기, 전자, 반도체 관련 경험·역량
+- AI/HPC/클라우드 데이터센터 및 xPU 기반 SoC·메모리·인터커넥트 아키텍처 R&D
+- UCIe, CXL, NVLink, 이더넷 등 시스템 인터커넥트 및 이종 메모리·가속기 기반 최적화
+- AI 모델/알고리즘 설계 또는 국제 학회·저널 연구 경험
+- 분산 시스템, 컨테이너, Kubernetes 등 시스템 SW 이해·활용
+
+==================================================
+2. 기존 자료에서 수정이 필요한 부분
+==================================================
+
+기존에 정리한
+'02_JOB리포트_SystemArchitecture_SoftwareSolution'은
+현재 공식 JD 기준으로 'Solution SW'보다는
+'System Architecture / Software Solution' 직무에 직접 연결되는 자료로 분류하는 것이 더 정확하다.
+
+즉, 앞으로는 다음 둘을 분리해야 한다.
+
+- Solution SW 자료
+- System Architecture / Software Solution 자료
+
+==================================================
+3. 다음 결정이 필요한 사항
+==================================================
+
+첫 RAG PoC를 어느 직무로 할지 결정해야 한다.
+
+선택 1) Solution SW
+장점:
+- 2026년 하반기 공식 JD가 매우 구체적임
+- Firmware, SSD Architecture, 시스템 성능 최적화 등 실제 직무 질문을 만들기 좋음
+
+선택 2) System Architecture / Software Solution
+장점:
+- 공식 JD + 별도의 JOB리포트/현직자 인터뷰가 있어 자료가 더 풍부함
+- AI 모델, AI 플랫폼, 시스템 SW 등 현재 AI Agent 과정과 연결하기 쉬움
+
+현재 자료의 풍부함과 사용자가 이해하기 쉬운 방향을 고려하면,
+첫 RAG 학습용 PoC는 'System Architecture / Software Solution'으로 잡는 방안도 검토할 가치가 있다.

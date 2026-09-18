@@ -1,0 +1,385 @@
+"""
+비언어 AI 분석 모듈 - v0.3 (캘리브레이션 구조 리팩터링 - 뼈대 단계)
+
+[전체 구조]
+    1. 공통 episode 판정 로직 (여러 항목에서 재사용)
+    2. baseline(개인 기준값) 계산 유틸 + CalibrationProfile 구조
+    3. 얼굴계열 5개 항목 - MediaPipe Face Mesh 영상 1회 스캔으로 원본 시계열 추출 후 계산
+       (얼굴방향, 시선, 눈깜빡임, 미소, 표정변화량)
+    4. 고개 끄덕임/젓기 - 얼굴방향 원본 시계열 재사용 (영상 재스캔 없음)
+    5. 자세계열 2개 항목 - MediaPipe Pose 영상 1회 스캔
+       (상체 움직임, 손 제스처)
+    6. 캘리브레이션 프로파일 추출 (세션 시작 전 별도 클립)
+    7. 음성계열 5개 항목 - librosa
+       (침묵, 평균음량, 발화속도, 피치변화, 필러워드)
+    8. 전체 진입점 analyze_video()
+    9. 단위 테스트 (mediapipe/librosa 없이도 로직만 검증 가능)
+
+[입력] video_path(+audio_path, stt_text) + calibration_video_path(선택, 강력 권장)
+[출력] 공통 필드명 가이드 기준 dict 하나
+
+[v0.3에서 바뀐 것 - 캘리브레이션 구조 리팩터링]
+    기존(v0.2)에는 "본 답변 영상의 첫 3초"를 그 자리에서 baseline으로 계산해 썼음.
+    문제: 그 3초가 실제로 "정면을 보고 있다"는 보장이 없음(질문 읽기, 딴생각 등).
+    웹캠은 화면 위쪽에 고정돼 있어 정면을 봐도 시선이 위로 뜨는 구조적 편향이 있는데,
+    이 편향은 "사용자가 의도적으로 카메라를 보는 순간"을 명시적으로 캡처해야만 상쇄됨.
+
+    → v0.3부터는 세션 시작 전 별도의 짧은 캘리브레이션 클립(3~5초, "카메라를 봐주세요"
+      안내 후 촬영)을 먼저 분석해 CalibrationProfile을 만들고, 이 값을 본 답변 분석에
+      전달하는 구조로 바꿈 (extract_calibration_profile 참고).
+
+    - baseline은 평균이 아니라 중앙값(median)을 사용 (캘리브레이션 중 순간적인
+      눈깜빡임/시선 이탈 한 번으로 기준값 전체가 왜곡되는 것을 방지).
+    - 캘리브레이션 유효성 검증(감지율, 움직임 안정성)을 추가함. 단, 실패했다고
+      세션을 완전히 막지는 않음 - is_valid=False로 표시해 리포트에 "이번 세션은
+      신뢰도가 낮을 수 있음" 안내만 띄우는 소프트 게이트 방식 (하드 블록 아님).
+    - 기존 함수들(analyze_face_direction 등)은 calibration 파라미터가 없으면
+      v0.2 방식(자체 첫 3초)으로 동작함 - 하위 호환용. 실제 서비스에서는 반드시
+      calibration을 넘겨써야 함.
+    - [스켈레톤 단계 한계] extract_calibration_profile의 detection_rate는
+      expected_frame_count를 안 넘기면 근사치(1.0에 가깝게) 처리됨. Frontend가
+      캘리브레이션 녹화 시간(고정 값)을 알고 있으므로 그 값과 fps를 곱해
+      넘겨주는 것을 권장. 재시도 횟수/UI 안내 문구는 PM·Frontend와 협의 필요.
+
+[다른 팀원이 알아야 할 것]
+    - 필드명은 공통 협업 가이드(v0.1) + Backend 제안 이름 비교표를 기준으로 함.
+      아직 최종 확정 전인 이름은 주석에 "확정 필요"로 표시함.
+    - 단위 미확정 필드(0~1 vs %, dBFS vs 정규화 등)는 일단 0~1 / dBFS로 반환.
+      Backend 협의 후 일괄 변환하면 되도록 값 계산 로직을 분리해둠.
+    - voice_emotion(음성 감정)은 측정기준정의서 기준 "평가 제외" 항목이라
+      이 파일에 포함하지 않음. 필요 시 별도 실험 로그로만 관리할 것.
+"""
+
+from dataclasses import dataclass, replace, asdict
+from typing import Callable, List, Tuple, Optional, Dict
+import json
+import math
+
+
+# ====================================================================
+# 1. 공통 episode 판정 로직
+# ====================================================================
+
+@dataclass
+class EpisodeConfig:
+    """
+    행동 1회(episode)를 판정하는 기준값.
+    - min_exceed_duration_sec: 기준 초과 상태가 최소 이만큼 지속돼야 1회로 인정
+    - min_return_duration_sec: 정상 복귀로 인정하는 최소 지속시간
+    """
+    min_exceed_duration_sec: float
+    min_return_duration_sec: float
+
+
+@dataclass
+class Episode:
+    start_sec: float
+    end_sec: float
+
+    @property
+    def duration_sec(self) -> float:
+        return self.end_sec - self.start_sec
+
+
+def detect_episodes(
+    timestamps: List[float],
+    values: List[float],
+    is_exceeding_fn: Callable[[float], bool],
+    config: EpisodeConfig,
+) -> List[Episode]:
+    """
+    "기준 초과 -> 최소 지속시간 유지 -> 정상 복귀"를 episode(행동 1회)로 판정.
+    [입력] timestamps, values(같은 길이), is_exceeding_fn(값->bool), config
+    [출력] Episode 리스트
+    """
+    if len(timestamps) != len(values):
+        raise ValueError("timestamps와 values의 길이가 다릅니다.")
+
+    episodes: List[Episode] = []
+    state = "normal"  # normal | exceeding | confirmed_exceeding
+    exceed_start: Optional[float] = None
+    return_start: Optional[float] = None
+    current_episode_start: Optional[float] = None
+
+    for t, v in zip(timestamps, values):
+        exceeding = is_exceeding_fn(v)
+
+        if state == "normal":
+            if exceeding:
+                state = "exceeding"
+                exceed_start = t
+
+        elif state == "exceeding":
+            if exceeding:
+                if t - exceed_start >= config.min_exceed_duration_sec:
+                    state = "confirmed_exceeding"
+                    current_episode_start = exceed_start
+            else:
+                state = "normal"
+                exceed_start = None
+
+        elif state == "confirmed_exceeding":
+            if exceeding:
+                return_start = None
+            else:
+                if return_start is None:
+                    return_start = t
+                elif t - return_start >= config.min_return_duration_sec:
+                    episodes.append(Episode(current_episode_start, return_start))
+                    state = "normal"
+                    current_episode_start = None
+                    return_start = None
+                    exceed_start = None
+
+    if state == "confirmed_exceeding" and current_episode_start is not None:
+        episodes.append(Episode(current_episode_start, timestamps[-1]))
+
+    return episodes
+
+
+def summarize_episodes(episodes: List[Episode]) -> Tuple[int, float]:
+    """episode 리스트 -> (횟수, 총 지속시간 초)"""
+    count = len(episodes)
+    total_sec = sum(e.duration_sec for e in episodes)
+    return count, total_sec
+
+
+# ----- 1-1. NonverbalEvent (nonverbal_events 테이블 - v0.3.2 신규) -----
+#
+# Backend 제안 models_proposed.py의 NonverbalEventsProposed(event_type, start_time_sec,
+# end_time_sec, value)와 필드를 맞춤. event_id/answer_id는 DB row 생성 시 Backend가
+# 채우는 PK/FK라 여기서는 만들지 않음 - 이 파일은 한 세션 분석 결과로 나온 이벤트 "내용"만 만듦.
+#
+# event_type 값 11종 확정 (2026-09 기준, Backend 테이블 캡션 "event_type 값들을 연진씨가
+# 정해야 함"에 대한 답): 아래 EVENT_TYPE_* 상수 참고.
+
+EVENT_TYPE_GAZE_AWAY = "GAZE_AWAY"                # 지속 이벤트 (시선이탈)
+EVENT_TYPE_FACE_TURNED = "FACE_TURNED"            # 지속 이벤트 (얼굴방향 이탈)
+EVENT_TYPE_LONG_BLINK = "LONG_BLINK"              # 지속 이벤트 (긴 눈감음, 0.5초 이상만)
+EVENT_TYPE_SMILE = "SMILE"                        # 지속 이벤트 (미소)
+EVENT_TYPE_EXPRESSION_CHANGE = "EXPRESSION_CHANGE"  # 순간 이벤트 (표정 급변화)
+EVENT_TYPE_NOD = "NOD"                            # 순간 이벤트 (고개 끄덕임)
+EVENT_TYPE_SHAKE = "SHAKE"                        # 순간 이벤트 (고개 젓기)
+EVENT_TYPE_BODY_MOVEMENT = "BODY_MOVEMENT"        # 지속 이벤트 (상체 흔들림)
+EVENT_TYPE_HAND_GESTURE = "HAND_GESTURE"          # 지속 이벤트 (손 제스처)
+EVENT_TYPE_LONG_PAUSE = "LONG_PAUSE"              # 지속 이벤트 (긴 침묵, 1초 이상만)
+EVENT_TYPE_FILLER_WORD = "FILLER_WORD"            # 순간 이벤트 (필러워드)
+
+# 리포트 타임라인에 마커로 찍을 만큼 "눈에 띄는" 것만 이벤트로 남긴다는 원칙.
+# (예: 일반 눈깜빡임/짧은 침묵은 초당 여러 번 나올 수 있어 전부 기록하면 오히려 리포트가
+#  묻힘 - LONG_BLINK/LONG_PAUSE처럼 "길게 지속된 것"만 이벤트로 승격시킴)
+
+
+@dataclass
+class NonverbalEvent:
+    """nonverbal_events 테이블 한 행에 대응 (event_id/answer_id 제외 - Backend가 삽입 시 채움)."""
+    event_type: str
+    start_time_sec: float
+    end_time_sec: Optional[float]  # 순간 이벤트는 None
+    value: Optional[str] = None
+
+
+def _episodes_to_events(
+    episodes: List[Episode],
+    event_type: str,
+    value_fn: Optional[Callable[[Episode], Optional[str]]] = None,
+    instant: bool = False,
+) -> List[NonverbalEvent]:
+    """
+    detect_episodes()가 뽑아낸 Episode 리스트를 NonverbalEvent 리스트로 변환하는 공통 헬퍼.
+    [입력]
+        instant: True면 "순간 이벤트"로 취급해 end_time_sec=None, start_time_sec=episode 시작 시각만 기록
+                 (예: 표정변화/고개끄덕임/필러워드처럼 "그 순간이 마커"인 항목)
+        value_fn: episode -> value 문자열 변환 함수. 없으면 value=None.
+    """
+    events = []
+    for e in episodes:
+        events.append(NonverbalEvent(
+            event_type=event_type,
+            start_time_sec=round(e.start_sec, 2),
+            end_time_sec=None if instant else round(e.end_sec, 2),
+            value=value_fn(e) if value_fn else None,
+        ))
+    return events
+
+
+# ====================================================================
+# 2. baseline(개인 기준값) 계산
+# ====================================================================
+
+def compute_baseline(timestamps: List[float], values: List[float], baseline_duration_sec: float = 3.0) -> float:
+    """시작 baseline_duration_sec(기본 3초) 구간의 평균값을 기준값으로 반환.
+    [견고성] 영상 초반에 얼굴/자세가 감지 안 된 경우(예: 짧은 영상, 화면 밖에서 시작)
+    첫 3초 구간에 데이터가 하나도 없을 수 있음 - 이 경우 세션 전체를 실패시키지 않고
+    감지된 값 중 가장 이른 프레임들로 대체함 (소프트 폴백)."""
+    baseline_values = [v for t, v in zip(timestamps, values) if t <= baseline_duration_sec]
+    if not baseline_values:
+        if not values:
+            raise ValueError("baseline 계산할 데이터가 전혀 없습니다.")
+        fallback_count = min(len(values), 10)
+        baseline_values = values[:fallback_count]
+    return sum(baseline_values) / len(baseline_values)
+
+
+def std_dev(values: List[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    return variance ** 0.5
+
+
+def median(values: List[float]) -> float:
+    """
+    중앙값. 캘리브레이션 baseline은 평균이 아니라 이 함수로 계산한다.
+    (짧은 캘리브레이션 클립 중 눈깜빡임 한 번, 시선이 잠깐 벗어난 프레임 하나가
+     평균이었다면 기준값 전체를 왜곡시킬 수 있음 - 중앙값은 이런 순간적 이상치에 강함)
+    """
+    if not values:
+        raise ValueError("median 계산할 값이 없습니다.")
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+def _value_at(timestamps: List[float], values: List[float], t: float) -> float:
+    """timestamps에서 t와 가장 가까운 인덱스의 값을 반환 (이벤트 value 방향 판정용)."""
+    idx = min(range(len(timestamps)), key=lambda i: abs(timestamps[i] - t))
+    return values[idx]
+
+
+def circular_mean_degrees(angles_deg: List[float]) -> float:
+    """
+    -180~180도 경계를 넘나드는 각도들의 평균을 올바르게 계산한다.
+    (예: -179도와 179도를 단순 산술평균 하면 0도가 나오지만, 실제로는 180도에 가까워야 함)
+    어깨선 각도처럼 좌우가 거의 나란해서 각도가 ±180 근처를 오가는 경우 반드시 이 함수를 사용해야
+    baseline이 뒤틀리지 않는다. (실측 영상 테스트로 발견된 버그 수정, v0.2)
+    """
+    import math
+    radians = [math.radians(a) for a in angles_deg]
+    sin_sum = sum(math.sin(r) for r in radians)
+    cos_sum = sum(math.cos(r) for r in radians)
+    return math.degrees(math.atan2(sin_sum, cos_sum))
+
+
+# ----- 2-1. CalibrationProfile (v0.3 신규) -----
+
+# 캘리브레이션 클립 권장 길이(초). Frontend/PM과 합의 후 조정 가능한 값.
+CALIBRATION_CLIP_DURATION_SEC = 4.0
+
+# 얼굴 캘리브레이션과 동시에 낭독시킬 중립 문장. 특정 감정/의견이 실리지 않는 인사말로 선정.
+# STT 없이도 word/syllable 수를 알 수 있어 발화속도 baseline 계산에 씀 (calculate_speaking_speed 재사용).
+CALIBRATION_SCRIPT_TEXT = "안녕하세요, 오늘 면접에 참여하게 되어 반갑습니다."
+
+# 캘리브레이션 유효성 판정 기준
+CALIBRATION_MIN_DETECTION_RATE = 0.9        # 얼굴/자세 감지율이 이보다 낮으면 무효
+CALIBRATION_MAX_LANDMARK_MOTION_SD = 0.02   # 표정변화량 표준편차가 이보다 크면 "가만히 있지 않음"
+
+
+@dataclass
+class CalibrationProfile:
+    """
+    세션 시작 전 별도로 촬영한 짧은 캘리브레이션 클립(3~5초, "카메라를 봐주세요" 안내 후
+    촬영)에서 뽑아낸 개인 기준값 모음. 본 답변 분석 시 이 값을 baseline으로 사용한다.
+
+    [설계 이유] 자세한 배경은 파일 상단 모듈 docstring의 "v0.3에서 바뀐 것" 참고.
+
+    [필드]
+        yaw/pitch/roll/gaze/ear/smile/landmark_motion_baseline: 얼굴계열 각 항목의 중앙값
+        shoulder_width_baseline: 어깨너비 중앙값 (다른 이동량을 정규화하는 척도로 사용)
+        shoulder_angle_baseline: 어깨선 각도 (circular mean - 경계 넘나들기 방지)
+        is_valid: 캘리브레이션 품질 검증 통과 여부 (아래 "소프트 게이트" 설명 참고)
+        validation_message: 검증 실패 시 사용자에게 보여줄 안내 문구 (사유 1개만)
+        detection_rate: 캘리브레이션 클립 전체 프레임 중 얼굴/자세가 감지된 비율
+
+    [소프트 게이트 - 하드 블록 아님]
+        is_valid=False라고 세션을 막지 않음. 대신 이 값을 그대로 리포트까지 들고 가서
+        "이번 세션은 캘리브레이션 품질이 낮아 시선/자세 지표 신뢰도가 낮을 수 있음" 같은
+        안내를 붙이는 용도로 씀. 완전 차단(하드 블록)은 사람마다 카메라/체형/환경이
+        달라 서비스 진입 자체를 막는 부작용이 있어 채택하지 않음 (FR-AI-010의
+        마이크/인원수 같은 이진 판정과는 성격이 다름 - 자세는 "정도"의 문제).
+        재시도 횟수, 실패 시 UI 문구 등은 PM/Frontend와 별도 협의 필요.
+
+    [음성 baseline - v0.3.1 추가]
+        voice_mean_db_baseline/voice_f0_mean_baseline/voice_f0_std_baseline/speaking_speed_baseline:
+        얼굴 캘리브레이션과 동시에, 정해진 중립 문장(CALIBRATION_SCRIPT_TEXT)을 소리 내어
+        읽게 해서 얻은 "이 사람의 평소 목소리" 기준값. 음량은 마이크 거리/게인에 따라,
+        피치는 사람마다 원래 저음/고음이 있어 절대값만으로는 "크게/작게 말했다",
+        "억양이 단조롭다/풍부하다"를 판단하기 어려움 - 이 baseline 대비 상대값으로
+        판단해야 개인차에 의한 오판정을 줄일 수 있음.
+        voice_calibration_valid/voice_calibration_message: 음성 캘리브레이션 자체의
+        성공 여부(얼굴/자세 캘리브레이션과는 별개 - 마이크 문제로 영상은 정상인데
+        음성만 실패할 수 있음). 기본값은 "미실행" - calibration_audio_path를 안 넘기면
+        이 상태로 남고, 본 분석에서 상대값 계산을 건너뛴다.
+    """
+    yaw_baseline: float
+    pitch_baseline: float
+    roll_baseline: float
+    gaze_baseline: float
+    ear_baseline: float
+    smile_baseline: float
+    landmark_motion_baseline: float
+    shoulder_width_baseline: float
+    shoulder_angle_baseline: float
+
+    is_valid: bool
+    validation_message: str
+    detection_rate: float
+
+    voice_mean_db_baseline: Optional[float] = None
+    voice_f0_mean_baseline: Optional[float] = None
+    voice_f0_std_baseline: Optional[float] = None
+    speaking_speed_baseline: Optional[float] = None  # 음절/분 기준 (calculate_speaking_speed 참고)
+    voice_calibration_valid: bool = False
+    voice_calibration_message: str = "음성 캘리브레이션 미실행"
+
+
+def build_calibration_profile_from_series(
+    face_series: "FaceMeshSeries",
+    pose_series: "PoseRawSeries",
+    expected_frame_count: Optional[int] = None,
+) -> CalibrationProfile:
+    """
+    이미 추출된 원본 시계열(FaceMeshSeries, PoseRawSeries)로부터 CalibrationProfile을
+    계산하는 순수 로직 함수. mediapipe/영상 파일 없이 합성 데이터로 테스트 가능하도록
+    영상 읽기(extract_calibration_profile)와 분리해뒀음.
+
+    [입력]
+        face_series, pose_series: 캘리브레이션 클립에서 추출한 원본 시계열
+        expected_frame_count: 감지율 계산 기준 총 프레임 수. 생략하면 "감지에 성공한
+            프레임 수"만으로 비율을 매기므로(=1.0에 가까워짐) 완전 미검출 구간을
+            걸러내지 못함. 실제 서비스에서는 캘리브레이션 녹화 시간 x fps로 계산해 넘길 것.
+    [출력] CalibrationProfile
+    """
+    detected_frames = len(face_series.timestamps)
+    total_frames = expected_frame_count if expected_frame_count is not None else detected_frames
+    detection_rate = round(detected_frames / total_frames, 3) if total_frames > 0 else 0.0
+
+    motion_sd = std_dev(face_series.landmark_motion)
+
+    is_valid = True
+    validation_message = "정상"
+    if detection_rate < CALIBRATION_MIN_DETECTION_RATE:
+        is_valid = False
+        validation_message = "얼굴/자세가 화면에 충분히 잡히지 않았어요. 카메라 정면에 위치해 다시 시도해주세요."
+    elif motion_sd > CALIBRATION_MAX_LANDMARK_MOTION_SD:
+        is_valid = False
+        validation_message = "촬영 중 움직임이 감지됐어요. 잠시 정면을 보고 가만히 있어주세요."
+
+    return CalibrationProfile(
+        yaw_baseline=median(face_series.yaw),
+        pitch_baseline=median(face_series.pitch),
+        roll_baseline=median(face_series.roll),
+        gaze_baseline=median(face_series.gaze_ratio),
+        ear_baseline=median(face_series.ear),
+        smile_baseline=median(face_series.smile_score),
+        landmark_motion_baseline=median(face_series.landmark_motion),
+        shoulder_width_baseline=median(pose_series.shoulder_width),
+        shoulder_angle_baseline=circular_mean_degrees(pose_series.shoulder_angle),
+        is_valid=is_valid,
+        validation_message=validation_message,
+        detection_rate=detection_rate,
+    )

@@ -1,0 +1,26 @@
+# Backend / DB
+fastapi
+uvicorn[standard]
+sqlmodel
+python-dotenv
+python-multipart
+
+# STT
+openai
+
+# RAG / AI
+langchain-openai
+langchain-core
+langchain-text-splitters
+sentence-transformers
+faiss-cpu
+pypdf
+pydantic>=2
+numpy
+
+# Local nonverbal analysis demo
+opencv-python
+mediapipe==0.10.14
+librosa
+soundfile
+scipy

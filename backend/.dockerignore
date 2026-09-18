@@ -1,0 +1,11 @@
+.venv
+__pycache__
+*.pyc
+app.db
+test_app.db
+test_ai_payload.db
+rag_data/
+uploads/
+.env
+.git
+README.md

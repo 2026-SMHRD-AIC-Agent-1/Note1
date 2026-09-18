@@ -1,0 +1,168 @@
+{
+  "session": {
+    "company": "SK하이닉스",
+    "job": "System Architecture / Software Solution",
+    "interview_type": "직무면접"
+  },
+  "questions": [
+    {
+      "question": {
+        "question_type": "직무이해",
+        "question_text": "SK하이닉스 System Architecture / Software Solution 직무에서 AI 모델이 새로운 메모리 환경에서 높은 성능을 내도록 소프트웨어 관점에서 시스템을 최적화한다고 했을 때, 이 직무를 수행할 때 가장 먼저 어떤 관점으로 AI 모델의 동작과 메모리 사용을 분석하겠습니까?",
+        "question_reason": "직무의 핵심 역할과 이해도를 확인하기 위한 질문입니다.",
+        "evaluation_points": [
+          "AI 모델 동작과 메모리 사용을 함께 보는 관점",
+          "데이터 이동과 메모리 활용이 성능에 미치는 영향에 대한 이해",
+          "소프트웨어와 하드웨어를 연결해 설명하는 능력"
+        ],
+        "rag_evidence": [
+          {
+            "source_title": "02_JOB리포트_SystemArchitecture_SoftwareSolution",
+            "category": "job",
+            "page": null,
+            "similarity": 0.7653
+          },
+          {
+            "source_title": "02_JOB리포트_SystemArchitecture_SoftwareSolution",
+            "category": "job",
+            "page": null,
+            "similarity": 0.5821
+          }
+        ]
+      },
+      "answer": {
+        "stt_text": "AI 모델의 성능은 연산 능력뿐 아니라 데이터 이동과 메모리 사용 방식에도 영향을 받는다고 생각합니다. 특히 대규모 AI 모델에서는 데이터를 얼마나 빠르고 효율적으로 전달하느냐가 전체 시스템 성능과 연결될 수 있습니다. 그래서 System Architecture / Software Solution 직무에서는 메모리 구조와 시스템 소프트웨어를 함께 이해하고 전체 시스템 관점에서 최적화하는 것이 중요하다고 생각합니다."
+      },
+      "answer_analysis": {
+        "job_evaluation": "일부 드러남",
+        "answer_evaluation": "일부 드러남",
+        "strengths": "AI 모델 성능을 연산뿐 아니라 데이터 이동과 메모리 사용과 연결해 보려는 관점은 질문의 핵심과 맞닿아 있습니다.",
+        "improvements": "가장 먼저 어떤 기준으로 모델 동작과 메모리 사용을 분석할지 한 가지 관점을 먼저 제시하고, 그 이유를 더 구체적으로 설명해야 합니다."
+      },
+      "nonverbal_metrics": {
+        "face_yaw": null,
+        "gaze_center_ratio": 0.82,
+        "blink_rate": null,
+        "smile_intensity": null,
+        "expression_change_count": null,
+        "upper_body_sway": null,
+        "head_nod_count": null,
+        "hand_gesture_rate": null,
+        "pause_count": 3,
+        "average_volume": null,
+        "speaking_speed": 125,
+        "pitch_variation": null,
+        "filler_word_count": 2,
+        "voice_emotion_label": null
+      }
+    },
+    {
+      "question": {
+        "question_type": "문제해결",
+        "question_text": "AI 모델을 적용했는데 예상보다 성능이 개선되지 않았다면, 어떤 순서로 원인을 점검하고 시스템을 재검토하겠습니까?",
+        "question_reason": "문제 발생 시 분석 방식과 해결 접근을 확인하기 위한 질문입니다.",
+        "evaluation_points": [
+          "한 가지 원인에만 매달리지 않고 시스템 전체를 보는 접근",
+          "AI 모델, 메모리 사용, 데이터 이동 등 복수 원인 검토",
+          "팀과 진행상황을 공유하며 함께 원인을 좁혀가는 방식"
+        ],
+        "rag_evidence": [
+          {
+            "source_title": "02_JOB리포트_SystemArchitecture_SoftwareSolution",
+            "category": "job",
+            "page": null,
+            "similarity": 0.5821
+          },
+          {
+            "source_title": "03_2026하반기_신입채용_면접구조",
+            "category": "interview",
+            "page": null,
+            "similarity": 0.4854
+          }
+        ]
+      },
+      "answer": {
+        "stt_text": "AI 모델의 성능이 기대만큼 나오지 않는다면 먼저 모델 자체의 문제인지 시스템 환경의 문제인지 확인하겠습니다. 그다음 프로파일링을 통해 병목 구간을 찾고, 데이터 이동과 메모리 사용량을 확인한 뒤 시스템 소프트웨어 영역까지 순서대로 점검하겠습니다. 가능성이 높은 원인부터 개선하고 성능을 다시 측정해서 결과를 검증하겠습니다."
+      },
+      "answer_analysis": {
+        "job_evaluation": "일부 드러남",
+        "answer_evaluation": "잘 드러남",
+        "strengths": "모델 문제와 시스템 환경 문제를 함께 보겠다는 점과, 프로파일링·데이터 이동·메모리까지 순서대로 점검하겠다는 흐름이 분명합니다.",
+        "improvements": "원인 점검 결과를 팀과 공유하며 함께 범위를 좁혀가는 협업 방식까지 포함하면 더 좋습니다."
+      },
+      "nonverbal_metrics": {
+        "face_yaw": null,
+        "gaze_center_ratio": 0.71,
+        "blink_rate": null,
+        "smile_intensity": null,
+        "expression_change_count": null,
+        "upper_body_sway": null,
+        "head_nod_count": null,
+        "hand_gesture_rate": null,
+        "pause_count": 6,
+        "average_volume": null,
+        "speaking_speed": 148,
+        "pitch_variation": null,
+        "filler_word_count": 7,
+        "voice_emotion_label": null
+      }
+    },
+    {
+      "question": {
+        "question_type": "협업",
+        "question_text": "SK하이닉스 직무 면접에서는 협업 역량도 확인한다고 되어 있습니다. System Architecture / Software Solution 업무를 수행하면서 팀원이나 다른 조직과 협업해야 했던 경험이 있다면, 어떤 방식으로 의견을 조율하고 진행상황을 공유했습니까?",
+        "question_reason": "협업 방식과 대화 속 소통 역량을 확인하기 위한 질문입니다.",
+        "evaluation_points": [
+          "팀원 및 다른 조직과 협업한 경험",
+          "의견 조율과 진행상황 공유 방식",
+          "기술을 논리적으로 설명하며 소통한 방식"
+        ],
+        "rag_evidence": [
+          {
+            "source_title": "02_JOB리포트_SystemArchitecture_SoftwareSolution",
+            "category": "job",
+            "page": null,
+            "similarity": 0.5821
+          },
+          {
+            "source_title": "04_공식_채용절차_AISK_면접",
+            "category": "interview_process",
+            "page": null,
+            "similarity": 0.5376
+          }
+        ]
+      },
+      "answer": {
+        "stt_text": "먼저 어느 쪽 의견이 맞는지를 판단하기보다 각 담당자가 어떤 근거와 데이터를 가지고 있는지 확인하겠습니다. 공통으로 확인할 수 있는 성능 지표와 로그를 정하고 같은 조건에서 테스트한 결과를 비교하겠습니다. 그 결과를 바탕으로 원인에 대한 가설을 정리하고 역할을 나누어 검증하겠습니다. 협업에서는 자신의 주장을 설득하는 것보다 같은 데이터를 보면서 문제를 좁혀가는 것이 중요하다고 생각합니다."
+      },
+      "answer_analysis": {
+        "job_evaluation": "일부 드러남",
+        "answer_evaluation": "보완 필요",
+        "strengths": "의견을 데이터와 테스트 결과로 조율하겠다는 협업 방식이 논리적으로 제시되어 있습니다.",
+        "improvements": "실제 팀원이나 다른 조직과 협업했던 구체적 경험과 진행상황 공유 방식이 없어 질문에 직접 답하도록 보완해야 합니다."
+      },
+      "nonverbal_metrics": {
+        "face_yaw": null,
+        "gaze_center_ratio": 0.88,
+        "blink_rate": null,
+        "smile_intensity": null,
+        "expression_change_count": null,
+        "upper_body_sway": null,
+        "head_nod_count": null,
+        "hand_gesture_rate": null,
+        "pause_count": 2,
+        "average_volume": null,
+        "speaking_speed": 118,
+        "pitch_variation": null,
+        "filler_word_count": 1,
+        "voice_emotion_label": null
+      }
+    }
+  ],
+  "final_coaching": {
+    "content_summary": "세 질문 모두 모델·문제 상황을 데이터·메모리·시스템 관점에서 함께 보려는 접근은 있었지만, 답변의 첫 기준과 핵심 근거를 먼저 제시하는 부분이 부족했습니다. 협업 질문에서는 실제 경험과 진행상황 공유 방식이 빠져 질문과 직접 연결되는 답변이 약했습니다.",
+    "delivery_summary": "정면 시선 비율은 질문별 0.71~0.88, 침묵 횟수는 2~6회, 발화 속도는 118~148, 필러워드는 1~7회로 측정되었습니다. 문제해결 답변에서 다른 두 답변보다 침묵과 필러워드가 더 많이 측정되었습니다.",
+    "priority_focus": "답변의 첫 1문장에서 관점과 기준을 먼저 선언하는 것",
+    "next_practice_goal": "다음 연습에서는 모든 답변을 ‘핵심 관점 1개 → 근거 2개 → 사례 1개’ 순서로 30초 안에 말하는 연습을 합니다."
+  }
+}
